@@ -4,6 +4,7 @@
 	"description": "A pi coding agent extension that tracks and displays session context (worktree, Jira ticket, GitLab MR) in the footer",
 	"keywords": ["pi-package", "pi-extension", "pi-coding-agent"],
 	"license": "MIT",
+	"files": ["extensions", "skills", "README.md"],
 	"type": "module",
 	"scripts": {
 		"lint": "biome check .",

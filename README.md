@@ -181,7 +181,7 @@ When the task is done, clear everything:
 ```bash
 pi install npm:pi-session-context
 # or directly from GitHub:
-pi install git:github.com/YOUR_USERNAME/pi-session-context
+pi install git:github.com/it-ony/pi-session-context
 ```
 
 ## Configuration
