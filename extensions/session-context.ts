@@ -8,21 +8,26 @@
  *   🌿 repo  branch       (type: "dir")
  *   📋 SDK-1234           (type: "link", Jira URL)
  *   🔀 #771               (type: "link", MR URL)
+ *   🟡 deploy             (type: "link", pipeline URL — live-updating icon)
  *   · env  staging        (no type — plain text)
  *
  * Two ways context is set:
  *  1. Passive  — worktree paths auto-detected from any tool call input
  *  2. Explicit — agent calls set_context with a map of entries
+ *  3. Monitor  — agent calls monitor_pipeline; icon updates automatically as status changes
  *
  * CWD behaviour:
  *   The entry with key "worktree" (type: "dir") controls the bash working directory.
  *   All subsequent bash commands run from that path — no cd prefix needed.
  *
  * State survives /reload and session restore via pi.appendEntry().
+ * Active pipeline monitors are also persisted and pollers restart on reload/startup.
  *
  * Configuration (environment variables):
- *   PI_WORKTREE_BASE  Base directory for git worktrees.
- *                     Default: ~/Development/worktree
+ *   PI_WORKTREE_BASE             Base directory for git worktrees. Default: ~/Development/worktree
+ *   GITLAB_TOKEN                 GitLab personal access token (for monitor_pipeline)
+ *   GITHUB_TOKEN                 GitHub personal access token (for monitor_pipeline)
+ *   PI_MONITOR_DEFAULT_INTERVAL  Default pipeline poll interval in seconds (default: 10)
  */
 
 import * as os from "node:os";
@@ -40,6 +45,11 @@ const WORKTREE_BASE =
 	process.env.PI_WORKTREE_BASE ??
 	nodePath.join(os.homedir(), "Development", "worktree");
 
+const PIPELINE_DEFAULT_INTERVAL = Math.max(
+	5,
+	Number(process.env.PI_MONITOR_DEFAULT_INTERVAL ?? "10"),
+);
+
 // ── Constants ──────────────────────────────────────────────────────────────────
 
 const ENTRY_TYPE = "session-context";
@@ -54,12 +64,73 @@ const DEFAULT_ICONS: Record<string, string> = {
 	mr: "🔀",
 };
 
+// ── Pipeline status ────────────────────────────────────────────────────────────
+
+type PipelineStatus =
+	| "pending"
+	| "running"
+	| "success"
+	| "failed"
+	| "canceled"
+	| "skipped"
+	| "unknown"
+	| "fetch_error";
+
+const STATUS_ICON: Record<PipelineStatus, string> = {
+	pending: "⏳",
+	running: "🟡",
+	success: "✅",
+	failed: "❌",
+	canceled: "⊘",
+	skipped: "⏭",
+	unknown: "❓",
+	fetch_error: "⚠️",
+};
+
+const TERMINAL_STATUSES: ReadonlySet<PipelineStatus> = new Set([
+	"success",
+	"failed",
+	"canceled",
+	"skipped",
+]);
+
+function isTerminal(s: PipelineStatus): boolean {
+	return TERMINAL_STATUSES.has(s);
+}
+
+// ── Raw provider status types ──────────────────────────────────────────────────
+
+type GitLabRawStatus =
+	| "created"
+	| "waiting_for_resource"
+	| "preparing"
+	| "scheduled"
+	| "manual"
+	| "pending"
+	| "running"
+	| "success"
+	| "failed"
+	| "canceled"
+	| "skipped";
+
+type GitHubRunStatus = "queued" | "in_progress" | "completed";
+type GitHubConclusion =
+	| "success"
+	| "failure"
+	| "cancelled"
+	| "skipped"
+	| "timed_out"
+	| "action_required"
+	| "neutral"
+	| null;
+
 // ── Types ──────────────────────────────────────────────────────────────────────
 
 interface ContextEntry {
 	value: string; // URL (link), filesystem path (dir), or plain text
 	type?: "link" | "dir"; // rendering mode; omit for plain text
-	icon?: string; // emoji / char shown before the value; falls back to DEFAULT_ICONS or "·"
+	icon?: string; // emoji shown before the entry; falls back to DEFAULT_ICONS or "·"
+	label?: string; // display label override for link entries (used by monitor_pipeline)
 }
 
 interface DerivedDir {
@@ -67,9 +138,151 @@ interface DerivedDir {
 	repoUrl: string | null;
 }
 
+/** Subset of PipelineMonitor that is safe to persist */
+interface PersistedMonitor {
+	key: string;
+	label: string;
+	url: string;
+	provider: "gitlab" | "github";
+	apiUrl: string;
+	status: PipelineStatus;
+	intervalSeconds: number;
+}
+
 interface PersistedState {
 	context: Record<string, ContextEntry>;
-	derived: Record<string, DerivedDir>; // git-detected info per "dir" entry
+	derived: Record<string, DerivedDir>;
+	monitors: PersistedMonitor[];
+	monitorCounter: number;
+}
+
+// ── URL parsing ────────────────────────────────────────────────────────────────
+
+interface ParsedPipelineUrl {
+	provider: "gitlab" | "github";
+	apiUrl: string;
+}
+
+function parseGitLabUrl(url: string): ParsedPipelineUrl | null {
+	// Pipeline:  https://<host>/group[/sub]/project/-/pipelines/ID
+	const pipeline = url.match(/^(https?:\/\/[^/]+)\/(.+?)\/-\/pipelines\/(\d+)/);
+	if (pipeline) {
+		const [, host, path, id] = pipeline;
+		return {
+			provider: "gitlab",
+			apiUrl: `${host}/api/v4/projects/${encodeURIComponent(path)}/pipelines/${id}`,
+		};
+	}
+	// Job:  https://<host>/group[/sub]/project/-/jobs/ID
+	const job = url.match(/^(https?:\/\/[^/]+)\/(.+?)\/-\/jobs\/(\d+)/);
+	if (job) {
+		const [, host, path, id] = job;
+		return {
+			provider: "gitlab",
+			apiUrl: `${host}/api/v4/projects/${encodeURIComponent(path)}/jobs/${id}`,
+		};
+	}
+	return null;
+}
+
+function parseGitHubUrl(url: string): ParsedPipelineUrl | null {
+	// Run:  https://github.com/owner/repo/actions/runs/ID
+	const run = url.match(
+		/^https:\/\/github\.com\/([^/]+)\/([^/]+)\/actions\/runs\/(\d+)/,
+	);
+	if (run) {
+		const [, owner, repo, id] = run;
+		return {
+			provider: "github",
+			apiUrl: `https://api.github.com/repos/${owner}/${repo}/actions/runs/${id}`,
+		};
+	}
+	return null;
+}
+
+function parsePipelineUrl(url: string): ParsedPipelineUrl | null {
+	return parseGitLabUrl(url) ?? parseGitHubUrl(url);
+}
+
+// ── API status mapping ─────────────────────────────────────────────────────────
+
+function mapGitLabStatus(raw: string): PipelineStatus {
+	switch (raw as GitLabRawStatus) {
+		case "created":
+		case "waiting_for_resource":
+		case "preparing":
+		case "scheduled":
+		case "manual":
+		case "pending":
+			return "pending";
+		case "running":
+			return "running";
+		case "success":
+			return "success";
+		case "failed":
+			return "failed";
+		case "canceled":
+			return "canceled";
+		case "skipped":
+			return "skipped";
+		default:
+			return "unknown";
+	}
+}
+
+function mapGitHubStatus(
+	status: GitHubRunStatus,
+	conclusion: GitHubConclusion,
+): PipelineStatus {
+	if (status === "queued") return "pending";
+	if (status === "in_progress") return "running";
+	switch (conclusion) {
+		case "success":
+		case "neutral":
+			return "success";
+		case "failure":
+		case "timed_out":
+			return "failed";
+		case "cancelled":
+			return "canceled";
+		case "skipped":
+			return "skipped";
+		case "action_required":
+			return "pending";
+		default:
+			return "unknown";
+	}
+}
+
+async function fetchPipelineStatus(
+	monitor: PersistedMonitor,
+): Promise<PipelineStatus> {
+	try {
+		const headers: Record<string, string> = {
+			Accept: "application/json",
+			"User-Agent": "pi-session-context/1.0",
+		};
+		if (monitor.provider === "gitlab") {
+			const token = process.env.GITLAB_TOKEN;
+			if (token) headers["PRIVATE-TOKEN"] = token;
+		} else {
+			const token = process.env.GITHUB_TOKEN;
+			if (token) headers.Authorization = `Bearer ${token}`;
+		}
+
+		const res = await fetch(monitor.apiUrl, { headers });
+		if (!res.ok) return "fetch_error";
+
+		const data = (await res.json()) as Record<string, unknown>;
+		return monitor.provider === "gitlab"
+			? mapGitLabStatus(String(data.status ?? ""))
+			: mapGitHubStatus(
+					data.status as GitHubRunStatus,
+					data.conclusion as GitHubConclusion,
+				);
+	} catch {
+		return "fetch_error";
+	}
 }
 
 // ── Helpers ────────────────────────────────────────────────────────────────────
@@ -87,6 +300,12 @@ function friendlyLabel(key: string, url: string): string {
 	// Jira browse
 	const jira = url.match(/\/browse\/([A-Z]+-\d+)/);
 	if (jira) return jira[1];
+	// GitLab pipeline or job
+	const pipeline = url.match(/\/-\/(?:pipelines|jobs)\/(\d+)/);
+	if (pipeline) return `!${pipeline[1]}`;
+	// GitHub Actions run
+	const ghRun = url.match(/\/actions\/runs\/(\d+)/);
+	if (ghRun) return `#${ghRun[1]}`;
 	// Last non-empty path segment
 	const seg = url.split("/").filter(Boolean).pop();
 	return seg ?? key;
@@ -100,6 +319,8 @@ export default function sessionContextExtension(pi: ExtensionAPI) {
 	const state: PersistedState = {
 		context: {},
 		derived: {},
+		monitors: [],
+		monitorCounter: 0,
 	};
 
 	// Tracks which status slots are currently occupied so we can clear removed keys
@@ -109,6 +330,12 @@ export default function sessionContextExtension(pi: ExtensionAPI) {
 	const gitRootCache = new Map<string, string | null>();
 	// Cache: git root → web URL (null = no detectable remote)
 	const repoUrlCache = new Map<string, string | null>();
+
+	// Active pipeline pollers keyed by monitor.key
+	const pipelineTimers = new Map<string, ReturnType<typeof setInterval>>();
+
+	// The most recently seen ctx — used by polling callbacks outside event handlers
+	let savedCtx: ExtensionContext | null = null;
 
 	// ── Git helpers ──────────────────────────────────────────────────────────
 
@@ -201,10 +428,11 @@ export default function sessionContextExtension(pi: ExtensionAPI) {
 		}
 
 		if (entry.type === "link") {
-			const label = friendlyLabel(key, entry.value);
+			// entry.label overrides auto-derived label (used by monitor_pipeline)
+			const displayLabel = entry.label ?? friendlyLabel(key, entry.value);
 			return (
 				theme.fg("dim", `${icon} `) +
-				link(entry.value, theme.fg("accent", label))
+				link(entry.value, theme.fg("accent", displayLabel))
 			);
 		}
 
@@ -275,16 +503,72 @@ export default function sessionContextExtension(pi: ExtensionAPI) {
 		return [...seen];
 	}
 
+	// ── Pipeline polling ──────────────────────────────────────────────────────
+
+	function stopPoller(key: string): void {
+		const t = pipelineTimers.get(key);
+		if (t !== undefined) {
+			clearInterval(t);
+			pipelineTimers.delete(key);
+		}
+	}
+
+	function stopAllPollers(): void {
+		for (const key of [...pipelineTimers.keys()]) stopPoller(key);
+	}
+
+	function startPoller(monitor: PersistedMonitor): void {
+		stopPoller(monitor.key); // clear any existing timer for this key
+
+		const handle = setInterval(async () => {
+			if (!savedCtx) return;
+
+			const newStatus = await fetchPipelineStatus(monitor);
+			if (newStatus === monitor.status) return;
+
+			monitor.status = newStatus;
+
+			// Update the icon on the context entry in-place
+			const entry = state.context[monitor.key];
+			if (entry) entry.icon = STATUS_ICON[newStatus];
+
+			// Sync persisted monitors array
+			const stored = state.monitors.find((m) => m.key === monitor.key);
+			if (stored) stored.status = newStatus;
+
+			persist();
+			refreshStatus(savedCtx);
+
+			if (isTerminal(newStatus)) {
+				stopPoller(monitor.key);
+				if (savedCtx.hasUI) {
+					savedCtx.ui.notify(
+						`${STATUS_ICON[newStatus]} ${monitor.label} — ${newStatus}`,
+						newStatus === "success" ? "info" : "error",
+					);
+				}
+			}
+		}, monitor.intervalSeconds * 1000);
+
+		pipelineTimers.set(monitor.key, handle);
+	}
+
 	// ── Session events ────────────────────────────────────────────────────────
 
 	pi.on("session_start", async (event, ctx) => {
+		savedCtx = ctx;
+
 		if (
 			event.reason === "new" ||
 			event.reason === "resume" ||
 			event.reason === "fork"
 		) {
+			// Fresh context — stop pollers and wipe state
+			stopAllPollers();
 			state.context = {};
 			state.derived = {};
+			state.monitors = [];
+			state.monitorCounter = 0;
 
 			if (ctx.cwd.startsWith(`${WORKTREE_BASE}/`)) {
 				await tryDetectWorktree(ctx.cwd, ctx);
@@ -306,7 +590,18 @@ export default function sessionContextExtension(pi: ExtensionAPI) {
 			);
 
 		if (last && "data" in last) {
-			Object.assign(state, (last as { data: PersistedState }).data);
+			const data = (last as { data: Partial<PersistedState> }).data;
+			state.context = data.context ?? {};
+			state.derived = data.derived ?? {};
+			state.monitors = data.monitors ?? [];
+			state.monitorCounter = data.monitorCounter ?? 0;
+		}
+
+		// Restart pollers for non-terminal monitors
+		for (const monitor of state.monitors) {
+			if (!isTerminal(monitor.status)) {
+				startPoller(monitor);
+			}
 		}
 
 		if (!state.context.worktree && ctx.cwd.startsWith(`${WORKTREE_BASE}/`)) {
@@ -316,7 +611,13 @@ export default function sessionContextExtension(pi: ExtensionAPI) {
 		}
 	});
 
+	pi.on("session_shutdown", async () => {
+		stopAllPollers();
+		savedCtx = null;
+	});
+
 	pi.on("tool_call", (_event, ctx) => {
+		savedCtx = ctx;
 		if (!ctx.hasUI) return;
 		const paths = extractPaths(JSON.stringify(_event.input));
 		void Promise.all(paths.map((p) => tryDetectWorktree(p, ctx)));
@@ -337,7 +638,8 @@ export default function sessionContextExtension(pi: ExtensionAPI) {
 			'         "dir"  → value is a worktree path; git root, branch, and remote are auto-detected.\n' +
 			'                  The key named "worktree" also sets the bash working directory.\n' +
 			"         omit   → plain text displayed as  icon  key  value.\n" +
-			"  icon   Single emoji or character shown before the entry. Optional.\n\n" +
+			"  icon   Single emoji or character shown before the entry. Optional.\n" +
+			"  label  Display label override for link entries. Optional.\n\n" +
 			"Default icons: worktree=🌿  ticket=📋  mr=🔀  others=·",
 		promptSnippet:
 			"Record active worktree, ticket, MR, or any custom key in the footer",
@@ -360,7 +662,7 @@ export default function sessionContextExtension(pi: ExtensionAPI) {
 						Type.Union([
 							Type.Literal("link", {
 								description:
-									"Value is a URL. Rendered as a clickable hyperlink with a friendly label.",
+									"Value is a URL. Rendered as a clickable hyperlink.",
 							}),
 							Type.Literal("dir", {
 								description:
@@ -373,6 +675,12 @@ export default function sessionContextExtension(pi: ExtensionAPI) {
 						Type.String({
 							description:
 								"Single emoji or character shown before the entry in the footer.",
+						}),
+					),
+					label: Type.Optional(
+						Type.String({
+							description:
+								"Display label override for link entries. Replaces the auto-derived label.",
 						}),
 					),
 				}),
@@ -393,6 +701,9 @@ export default function sessionContextExtension(pi: ExtensionAPI) {
 					if (state.context[key] !== undefined) {
 						delete state.context[key];
 						delete state.derived[key];
+						// Also stop any monitor using this key
+						stopPoller(key);
+						state.monitors = state.monitors.filter((m) => m.key !== key);
 						updated.push(`${key} cleared`);
 					}
 				} else if (entry.type === "dir") {
@@ -415,6 +726,206 @@ export default function sessionContextExtension(pi: ExtensionAPI) {
 				content: [{ type: "text", text: `Context updated: ${summary}` }],
 				details: { context: state.context },
 			};
+		},
+	});
+
+	// ── monitor_pipeline tool ─────────────────────────────────────────────────
+
+	pi.registerTool({
+		name: "monitor_pipeline",
+		label: "Monitor Pipeline",
+		description:
+			"Monitor a GitLab or GitHub pipeline/job. Adds a live clickable entry to the footer " +
+			"whose icon updates automatically as the status changes. Notifies via pi when done.\n\n" +
+			"Supported URL formats:\n" +
+			"  GitLab pipeline:  https://<host>/group/project/-/pipelines/ID\n" +
+			"  GitLab job:       https://<host>/group/project/-/jobs/ID\n" +
+			"  GitHub run:       https://github.com/owner/repo/actions/runs/ID\n\n" +
+			"Self-hosted GitLab is supported — any host is accepted.\n\n" +
+			"Required env vars: GITLAB_TOKEN (GitLab), GITHUB_TOKEN (GitHub)",
+		promptSnippet:
+			"Monitor a GitLab/GitHub pipeline or job — live icon in the footer",
+		promptGuidelines: [
+			"Call monitor_pipeline after triggering a CI pipeline so the user can track it passively",
+			"Use a short descriptive label: deploy, tests, build, e2e",
+			"Use the full pipeline/job URL from CI output or the web UI",
+		],
+		parameters: Type.Object({
+			url: Type.String({
+				description:
+					"Full URL of the GitLab pipeline/job or GitHub Actions workflow run",
+			}),
+			label: Type.String({
+				description:
+					"Short display name shown in the footer, e.g. 'deploy', 'tests', 'build'",
+			}),
+			interval_seconds: Type.Optional(
+				Type.Number({
+					description: `Poll interval in seconds (default: ${PIPELINE_DEFAULT_INTERVAL}, min: 5)`,
+				}),
+			),
+		}),
+
+		async execute(_id, params, _signal, _onUpdate, ctx) {
+			savedCtx = ctx;
+
+			const parsed = parsePipelineUrl(params.url);
+			if (!parsed) {
+				throw new Error(
+					"Unrecognized URL format. Expected:\n" +
+						"  GitLab pipeline:  https://<host>/group/project/-/pipelines/ID\n" +
+						"  GitLab job:       https://<host>/group/project/-/jobs/ID\n" +
+						"  GitHub run:       https://github.com/owner/repo/actions/runs/ID",
+				);
+			}
+
+			const key = `ci-${++state.monitorCounter}`;
+			const intervalSeconds = Math.max(
+				5,
+				params.interval_seconds ?? PIPELINE_DEFAULT_INTERVAL,
+			);
+
+			const monitor: PersistedMonitor = {
+				key,
+				label: params.label,
+				url: params.url,
+				provider: parsed.provider,
+				apiUrl: parsed.apiUrl,
+				status: "pending",
+				intervalSeconds,
+			};
+
+			// Fetch initial status before showing in footer
+			monitor.status = await fetchPipelineStatus(monitor);
+
+			// Register in context (renders as a link entry with live icon)
+			state.context[key] = {
+				type: "link",
+				value: params.url,
+				icon: STATUS_ICON[monitor.status],
+				label: params.label,
+			};
+
+			state.monitors.push(monitor);
+			persist();
+			refreshStatus(ctx);
+
+			if (!isTerminal(monitor.status)) {
+				startPoller(monitor);
+			} else {
+				// Already finished — notify immediately, no polling needed
+				ctx.ui.notify(
+					`${STATUS_ICON[monitor.status]} ${monitor.label} — ${monitor.status}`,
+					monitor.status === "success" ? "info" : "error",
+				);
+			}
+
+			const statusMsg = isTerminal(monitor.status)
+				? `already ${monitor.status} — no polling needed`
+				: `polling every ${intervalSeconds}s`;
+
+			return {
+				content: [
+					{
+						type: "text",
+						text: `Monitoring ${monitor.label} (${monitor.status}, ${statusMsg}).`,
+					},
+				],
+				details: {
+					key,
+					label: monitor.label,
+					status: monitor.status,
+					url: monitor.url,
+					provider: monitor.provider,
+					intervalSeconds,
+				},
+			};
+		},
+	});
+
+	// ── stop_monitor tool ────────────────────────────────────────────────────
+
+	pi.registerTool({
+		name: "stop_monitor",
+		label: "Stop Monitor",
+		description:
+			"Stop monitoring a pipeline and remove it from the footer. Identifies the monitor by label.",
+		promptSnippet: "Remove a pipeline monitor from the footer by label",
+		parameters: Type.Object({
+			label: Type.String({
+				description:
+					"Label of the monitor to remove (as passed to monitor_pipeline)",
+			}),
+		}),
+
+		async execute(_id, params, _signal, _onUpdate, ctx) {
+			const monitor = state.monitors.find(
+				(m) => m.label.toLowerCase() === params.label.toLowerCase(),
+			);
+
+			if (!monitor) {
+				const available =
+					state.monitors.map((m) => m.label).join(", ") || "none";
+				throw new Error(
+					`No monitor found with label "${params.label}". Active monitors: ${available}`,
+				);
+			}
+
+			stopPoller(monitor.key);
+			delete state.context[monitor.key];
+			state.monitors = state.monitors.filter((m) => m.key !== monitor.key);
+			persist();
+			refreshStatus(ctx);
+
+			return {
+				content: [
+					{ type: "text", text: `Stopped monitoring ${monitor.label}.` },
+				],
+				details: { label: monitor.label },
+			};
+		},
+	});
+
+	// ── /monitors command ─────────────────────────────────────────────────────
+
+	pi.registerCommand("pipeline-monitors", {
+		description: "List active pipeline monitors — select one to remove it",
+		handler: async (_args, ctx) => {
+			if (!ctx.hasUI) return;
+
+			if (state.monitors.length === 0) {
+				ctx.ui.notify("No active monitors", "info");
+				return;
+			}
+
+			const options = state.monitors.map(
+				(m) => `${STATUS_ICON[m.status]} ${m.label}  ${m.status}`,
+			);
+
+			const choice = await ctx.ui.select(
+				"Pipeline monitors — pick one to remove:",
+				options,
+			);
+			if (!choice) return;
+
+			// Match choice back to monitor by index
+			const idx = options.indexOf(choice);
+			const monitor = state.monitors[idx];
+			if (!monitor) return;
+
+			const confirmed = await ctx.ui.confirm(
+				"Remove monitor?",
+				`Stop tracking ${monitor.label} and remove it from the footer.`,
+			);
+			if (!confirmed) return;
+
+			stopPoller(monitor.key);
+			delete state.context[monitor.key];
+			state.monitors = state.monitors.filter((m) => m.key !== monitor.key);
+			persist();
+			refreshStatus(ctx);
+
+			ctx.ui.notify(`Removed monitor: ${monitor.label}`, "info");
 		},
 	});
 }

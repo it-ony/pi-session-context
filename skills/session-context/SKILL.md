@@ -1,7 +1,7 @@
 ---
 name: session-context
-description: "Guide for using the set_context tool. Covers worktree, Jira ticket, GitLab/GitHub MR, and custom key use cases. Load when starting work on a task or when context tracking needs to be set up."
-argument-hint: worktree path, ticket key, or MR URL
+description: "Guide for using the set_context and monitor_pipeline tools. Covers worktree, Jira ticket, GitLab/GitHub MR, custom key use cases, and monitoring CI pipeline status in the footer. Load when starting work on a task or when context tracking needs to be set up."
+argument-hint: worktree path, ticket key, MR URL, or pipeline URL
 ---
 
 ## Overview
@@ -124,6 +124,68 @@ Renders as: `🌐 env  staging   🎯 target  develop`
 
 ---
 
+## monitor_pipeline — CI Pipeline Status
+
+Use `monitor_pipeline` after triggering a GitLab or GitHub pipeline/job. The extension
+fetches the status immediately, shows a live clickable badge in the footer, and polls
+automatically until the pipeline reaches a terminal state. Notifies via `ctx.ui.notify`
+when done — no follow-up calls needed.
+
+```
+monitor_pipeline({
+  url:              "https://gitlab.com/org/repo/-/pipelines/12345",
+  label:            "deploy",
+  interval_seconds: 30        // optional, default 10, min 5
+})
+```
+
+**Supported URL formats:**
+
+| Platform | Pattern |
+|----------|---------|
+| GitLab pipeline | `https://<host>/group/project/-/pipelines/ID` |
+| GitLab job | `https://<host>/group/project/-/jobs/ID` |
+| GitHub Actions run | `https://github.com/owner/repo/actions/runs/ID` |
+
+Self-hosted GitLab is supported — any host is accepted.
+
+**Token env vars:** `GITLAB_TOKEN` (GitLab), `GITHUB_TOKEN` (GitHub)
+
+**Footer rendering** — one slot per monitor, icon updates automatically:
+
+```
+⏳ deploy        (pending)
+🟡 deploy        (running)   ← clickable link to the pipeline URL
+✅ deploy        (success)
+❌ deploy        (failed)
+```
+
+**Status icons:**
+
+| Icon | Status |
+|------|--------|
+| ⏳ | pending / queued |
+| 🟡 | running |
+| ✅ | success |
+| ❌ | failed |
+| ⊘ | canceled |
+| ⏭ | skipped |
+| ⚠️ | fetch error (auth / network) |
+
+The label is the clickable text in the footer — keep it short and descriptive
+(`deploy`, `tests`, `build`, `e2e`).
+
+### Removing a monitor
+
+**As the agent** — call `stop_monitor` with the label:
+```
+stop_monitor({ label: "deploy" })
+```
+
+**As the user** — type `/pipeline-monitors` to get an interactive list; select a monitor to remove it.
+
+---
+
 ## Full lifecycle example
 
 **Starting work:**
@@ -144,6 +206,16 @@ set_context({
   }
 })
 ```
+
+**After triggering a pipeline:**
+```
+monitor_pipeline({
+  url:   "https://gitlab.example.com/org/repo/-/pipelines/12345",
+  label: "deploy"
+})
+```
+
+Footer becomes: `🌿 my-repo  feat/…   📋 SDK-1234   🔀 #771   🟡 deploy`
 
 **Done — clear everything:**
 ```

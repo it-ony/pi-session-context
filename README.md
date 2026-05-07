@@ -1,12 +1,12 @@
 # pi-session-context
 
-A [pi coding agent](https://github.com/mariozechner/pi-coding-agent) extension that tracks and displays what the agent is working on in the footer — worktree, Jira ticket, GitLab/GitHub MR, or any custom key.
+A [pi coding agent](https://github.com/mariozechner/pi-coding-agent) extension that tracks and displays what the agent is working on in the footer — worktree, Jira ticket, GitLab/GitHub MR, pipeline status, or any custom key.
 
 ```
-🌿 my-repo  feat/SDK-1234-fix-auth   📋 SDK-1234   🔀 #771   · env  staging
+🌿 my-repo  feat/SDK-1234-fix-auth   📋 SDK-1234   🔀 #771   🟡 deploy
 ```
 
-Ticket and MR numbers are clickable OSC 8 hyperlinks in supported terminals.
+Entries are clickable OSC 8 hyperlinks in supported terminals. Pipeline icons update automatically as the build progresses.
 
 ## How it works
 
@@ -18,7 +18,7 @@ Context entries are stored as a map. Each entry has a **value**, an optional **t
 | `"link"` | clickable hyperlink with a friendly label | full URL |
 | _(omit)_ | `icon  key  value` plain text | anything |
 
-The agent calls `set_context` with a map of entries to update. Keys not mentioned are left unchanged. Pass `value: ""` to clear a key.
+The agent calls `set_context` with a map of entries to update. Keys not mentioned are left unchanged. Pass `value: ""` to clear a key. An optional `label` field overrides the auto-derived display text for `link` entries.
 
 ### Well-known keys
 
@@ -127,6 +127,47 @@ Renders as: `🌐 env  staging   🎯 target  develop`
 
 ---
 
+### Pipeline monitoring
+
+Use `monitor_pipeline` after triggering a CI/CD pipeline. The extension fetches the status immediately, shows a live clickable badge in the footer, and polls until the pipeline finishes. A pi notification fires on completion.
+
+```json
+{
+  "url":              "https://gitlab.com/org/repo/-/pipelines/12345",
+  "label":            "deploy",
+  "interval_seconds": 30
+}
+```
+
+**Supported URL formats:**
+
+| Platform | Pattern |
+|----------|---------|
+| GitLab pipeline | `https://<host>/group/project/-/pipelines/ID` |
+| GitLab job | `https://<host>/group/project/-/jobs/ID` |
+| GitHub Actions run | `https://github.com/owner/repo/actions/runs/ID` |
+
+Self-hosted GitLab is supported — any host is accepted.
+
+**Status icons** — update automatically in the footer:
+
+| Icon | Status |
+|------|--------|
+| ⏳ | pending / queued |
+| 🟡 | running |
+| ✅ | success |
+| ❌ | failed |
+| ⊘ | canceled |
+| ⏭ | skipped |
+| ⚠️ | fetch error (bad token / network) |
+
+**Removing a monitor:**
+
+- Agent: call `stop_monitor({ label: "deploy" })`
+- User: type `/pipeline-monitors` → interactive list → select → confirm
+
+---
+
 ### Putting it all together
 
 A typical agent call when starting work on a ticket:
@@ -148,7 +189,7 @@ A typical agent call when starting work on a ticket:
 }
 ```
 
-After pushing and opening the MR, add it:
+After pushing and opening the MR, add it. Then kick off CI and monitor it:
 
 ```json
 {
@@ -162,6 +203,16 @@ After pushing and opening the MR, add it:
 }
 ```
 
+```json
+// monitor_pipeline
+{
+  "url":   "https://gitlab.example.com/myorg/my-repo/-/pipelines/12345",
+  "label": "deploy"
+}
+```
+
+Footer: `🌿 my-repo  feat/…   📋 SDK-1234   🔀 #771   🟡 deploy`
+
 When the task is done, clear everything:
 
 ```json
@@ -172,6 +223,13 @@ When the task is done, clear everything:
     "mr":       { "value": "" }
   }
 }
+```
+
+Stop any remaining monitors:
+
+```json
+// stop_monitor
+{ "label": "deploy" }
 ```
 
 ---
@@ -189,6 +247,9 @@ pi install git:github.com/it-ony/pi-session-context
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `PI_WORKTREE_BASE` | `~/Development/worktree` | Base directory scanned for git worktrees |
+| `GITLAB_TOKEN` | — | GitLab personal access token (`read_api` scope). Required for private projects. |
+| `GITHUB_TOKEN` | — | GitHub personal access token. Required for private repos. |
+| `PI_MONITOR_DEFAULT_INTERVAL` | `10` | Default pipeline poll interval in seconds (min 5). |
 
 Set in your shell config (e.g. `~/.config/fish/config.fish` or `~/.zshrc`):
 
