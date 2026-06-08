@@ -147,6 +147,7 @@ interface PersistedMonitor {
 	apiUrl: string;
 	status: PipelineStatus;
 	intervalSeconds: number;
+	autoPrompt: boolean;
 }
 
 interface PersistedState {
@@ -547,6 +548,19 @@ export default function sessionContextExtension(pi: ExtensionAPI) {
 						newStatus === "success" ? "info" : "error",
 					);
 				}
+				// Auto-inject a user message so the agent responds to the failure
+				if (newStatus === "failed" && savedCtx.hasUI && monitor.autoPrompt) {
+					const prompt = `The \`${monitor.label}\` pipeline has failed.\nPipeline: ${monitor.url}`;
+					try {
+						if (savedCtx.isIdle()) {
+							pi.sendUserMessage(prompt);
+						} else {
+							pi.sendUserMessage(prompt, { deliverAs: "followUp" });
+						}
+					} catch {
+						// Ignore — agent may not be in a receptive state
+					}
+				}
 			}
 		}, monitor.intervalSeconds * 1000);
 
@@ -742,7 +756,8 @@ export default function sessionContextExtension(pi: ExtensionAPI) {
 			"  GitLab job:       https://<host>/group/project/-/jobs/ID\n" +
 			"  GitHub run:       https://github.com/owner/repo/actions/runs/ID\n\n" +
 			"Self-hosted GitLab is supported — any host is accepted.\n\n" +
-			"Required env vars: GITLAB_TOKEN (GitLab), GITHUB_TOKEN (GitHub)",
+			"Required env vars: GITLAB_TOKEN (GitLab), GITHUB_TOKEN (GitHub)\n\n" +
+			"Set auto_prompt: false to suppress the automatic failure prompt.",
 		promptSnippet:
 			"Monitor a GitLab/GitHub pipeline or job — live icon in the footer",
 		promptGuidelines: [
@@ -762,6 +777,13 @@ export default function sessionContextExtension(pi: ExtensionAPI) {
 			interval_seconds: Type.Optional(
 				Type.Number({
 					description: `Poll interval in seconds (default: ${PIPELINE_DEFAULT_INTERVAL}, min: 5)`,
+				}),
+			),
+			auto_prompt: Type.Optional(
+				Type.Boolean({
+					description:
+						"When true (default), automatically sends a user message to the agent if the pipeline fails, " +
+						"triggering a response. Set to false to suppress this behaviour.",
 				}),
 			),
 		}),
@@ -793,6 +815,7 @@ export default function sessionContextExtension(pi: ExtensionAPI) {
 				apiUrl: parsed.apiUrl,
 				status: "pending",
 				intervalSeconds,
+				autoPrompt: params.auto_prompt ?? true,
 			};
 
 			// Fetch initial status before showing in footer
@@ -818,6 +841,14 @@ export default function sessionContextExtension(pi: ExtensionAPI) {
 					`${STATUS_ICON[monitor.status]} ${monitor.label} — ${monitor.status}`,
 					monitor.status === "success" ? "info" : "error",
 				);
+				if (monitor.status === "failed" && monitor.autoPrompt) {
+					const prompt = `The \`${monitor.label}\` pipeline has failed.\nPipeline: ${monitor.url}`;
+					try {
+						pi.sendUserMessage(prompt, { deliverAs: "followUp" });
+					} catch {
+						// Ignore — agent may not be in a receptive state
+					}
+				}
 			}
 
 			const statusMsg = isTerminal(monitor.status)
