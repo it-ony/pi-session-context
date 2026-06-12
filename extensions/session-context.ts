@@ -98,6 +98,25 @@ function isTerminal(s: PipelineStatus): boolean {
 	return TERMINAL_STATUSES.has(s);
 }
 
+// ── MR Monitor status ─────────────────────────────────────────────────────────
+
+type MrMonitorStatus =
+	| "monitoring"
+	| "approved"
+	| "new_comments"
+	| "merged"
+	| "closed"
+	| "fetch_error";
+
+const MR_STATUS_ICON: Record<MrMonitorStatus, string> = {
+	monitoring: "🔍",
+	approved: "✅",
+	new_comments: "💬",
+	merged: "🎉",
+	closed: "🚫",
+	fetch_error: "⚠️",
+};
+
 // ── Raw provider status types ──────────────────────────────────────────────────
 
 type GitLabRawStatus =
@@ -150,10 +169,45 @@ interface PersistedMonitor {
 	autoPrompt: boolean;
 }
 
+/** State fetched from a single MR / PR poll */
+interface MrState {
+	approvals: number;
+	requiredApprovals: number; // -1 = unknown
+	fullyApproved: boolean;
+	commentIds: string[]; // all source-code comment IDs currently on the MR
+	merged: boolean;
+	closed: boolean;
+}
+
+/** Persisted state for a single MR / PR monitor */
+interface PersistedMrMonitor {
+	key: string;
+	label: string;
+	url: string;
+	provider: "gitlab" | "github";
+	// GitLab
+	gitlabHost?: string;
+	projectEncoded?: string;
+	mrIid?: number;
+	// GitHub
+	owner?: string;
+	repo?: string;
+	prNumber?: number;
+	// State
+	approvals: number;
+	requiredApprovals: number; // -1 = unknown
+	fullyApproved: boolean;
+	seenCommentIds: string[];
+	mrStatus: MrMonitorStatus;
+	intervalSeconds: number;
+	autoPrompt: boolean;
+}
+
 interface PersistedState {
 	context: Record<string, ContextEntry>;
 	derived: Record<string, DerivedDir>;
 	monitors: PersistedMonitor[];
+	mrMonitors: PersistedMrMonitor[];
 	monitorCounter: number;
 }
 
@@ -203,6 +257,39 @@ function parseGitHubUrl(url: string): ParsedPipelineUrl | null {
 
 function parsePipelineUrl(url: string): ParsedPipelineUrl | null {
 	return parseGitLabUrl(url) ?? parseGitHubUrl(url);
+}
+
+// ── MR URL parsing ────────────────────────────────────────────────────────────
+
+interface ParsedMrUrl {
+	provider: "gitlab" | "github";
+	gitlabHost?: string;
+	projectEncoded?: string;
+	mrIid?: number;
+	owner?: string;
+	repo?: string;
+	prNumber?: number;
+}
+
+function parseMrUrl(url: string): ParsedMrUrl | null {
+	// GitLab MR:  https://<host>/group[/sub]/project/-/merge_requests/IID
+	const gl = url.match(/^(https?:\/\/[^/]+)\/(.+?)\/-\/merge_requests\/(\d+)/);
+	if (gl) {
+		const [, host, path, iid] = gl;
+		return {
+			provider: "gitlab",
+			gitlabHost: host,
+			projectEncoded: encodeURIComponent(path),
+			mrIid: Number(iid),
+		};
+	}
+	// GitHub PR:  https://github.com/owner/repo/pull/NUMBER
+	const gh = url.match(/^https:\/\/github\.com\/([^/]+)\/([^/]+)\/pull\/(\d+)/);
+	if (gh) {
+		const [, owner, repo, number] = gh;
+		return { provider: "github", owner, repo, prNumber: Number(number) };
+	}
+	return null;
 }
 
 // ── API status mapping ─────────────────────────────────────────────────────────
@@ -286,6 +373,174 @@ async function fetchPipelineStatus(
 	}
 }
 
+// ── MR state fetching ─────────────────────────────────────────────────────────
+
+async function fetchGitLabMrState(
+	monitor: PersistedMrMonitor,
+): Promise<MrState> {
+	const base = `${monitor.gitlabHost}/api/v4/projects/${monitor.projectEncoded}/merge_requests/${monitor.mrIid}`;
+	const headers: Record<string, string> = {
+		Accept: "application/json",
+		"User-Agent": "pi-session-context/1.0",
+	};
+	const token = process.env.GITLAB_TOKEN;
+	if (token) headers["PRIVATE-TOKEN"] = token;
+
+	const [mrRes, approvalsRes, discussionsRes] = await Promise.all([
+		fetch(base, { headers }),
+		fetch(`${base}/approvals`, { headers }),
+		fetch(`${base}/discussions?per_page=100`, { headers }),
+	]);
+
+	if (!mrRes.ok) throw new Error(`MR fetch failed: ${mrRes.status}`);
+	const mr = (await mrRes.json()) as { state: string };
+
+	let approvalsCount = 0;
+	let requiredApprovals = 0;
+	if (approvalsRes.ok) {
+		const appData = (await approvalsRes.json()) as {
+			approved_by: unknown[];
+			approvals_required: number;
+		};
+		approvalsCount = appData.approved_by.length;
+		requiredApprovals = appData.approvals_required;
+	}
+
+	const commentIds: string[] = [];
+	if (discussionsRes.ok) {
+		const discussions = (await discussionsRes.json()) as Array<{
+			notes: Array<{
+				id: number;
+				system: boolean;
+				position: Record<string, unknown> | null;
+			}>;
+		}>;
+		for (const disc of discussions) {
+			const first = disc.notes[0];
+			// Diff discussions have a position on the first note
+			if (!first || first.system || first.position === null) continue;
+			for (const note of disc.notes) {
+				if (!note.system) commentIds.push(String(note.id));
+			}
+		}
+	}
+
+	return {
+		approvals: approvalsCount,
+		requiredApprovals,
+		fullyApproved:
+			requiredApprovals === 0 || approvalsCount >= requiredApprovals,
+		commentIds,
+		merged: mr.state === "merged",
+		closed: mr.state === "closed",
+	};
+}
+
+async function fetchGitHubPrState(
+	monitor: PersistedMrMonitor,
+): Promise<MrState> {
+	const base = `https://api.github.com/repos/${monitor.owner}/${monitor.repo}`;
+	const headers: Record<string, string> = {
+		Accept: "application/vnd.github+json",
+		"User-Agent": "pi-session-context/1.0",
+		"X-GitHub-Api-Version": "2022-11-28",
+	};
+	const token = process.env.GITHUB_TOKEN;
+	if (token) headers.Authorization = `Bearer ${token}`;
+
+	const [prRes, reviewsRes, commentsRes] = await Promise.all([
+		fetch(`${base}/pulls/${monitor.prNumber}`, { headers }),
+		fetch(`${base}/pulls/${monitor.prNumber}/reviews?per_page=100`, {
+			headers,
+		}),
+		fetch(`${base}/pulls/${monitor.prNumber}/comments?per_page=100`, {
+			headers,
+		}),
+	]);
+
+	if (!prRes.ok) throw new Error(`PR fetch failed: ${prRes.status}`);
+	const pr = (await prRes.json()) as {
+		state: string;
+		merged: boolean;
+		base: { ref: string };
+	};
+
+	// Count unique approvers — last review state per user wins
+	let approvalsCount = 0;
+	if (reviewsRes.ok) {
+		const reviews = (await reviewsRes.json()) as Array<{
+			user: { id: number };
+			state: string;
+		}>;
+		const latestByUser = new Map<number, string>();
+		for (const r of reviews) {
+			if (r.state !== "PENDING" && r.user?.id) {
+				latestByUser.set(r.user.id, r.state);
+			}
+		}
+		approvalsCount = [...latestByUser.values()].filter(
+			(s) => s === "APPROVED",
+		).length;
+	}
+
+	// Fetch required approvals from branch protection once (then cached on monitor)
+	let requiredApprovals = monitor.requiredApprovals;
+	if (requiredApprovals === -1 && pr.base?.ref) {
+		try {
+			const protRes = await fetch(
+				`${base}/branches/${encodeURIComponent(pr.base.ref)}`,
+				{ headers },
+			);
+			if (protRes.ok) {
+				const branch = (await protRes.json()) as {
+					protection?: {
+						required_pull_request_reviews?: {
+							required_approving_review_count?: number;
+						};
+					};
+				};
+				requiredApprovals =
+					branch.protection?.required_pull_request_reviews
+						?.required_approving_review_count ?? -1;
+			}
+		} catch {
+			// keep -1
+		}
+	}
+
+	const fullyApproved =
+		requiredApprovals > 0
+			? approvalsCount >= requiredApprovals
+			: approvalsCount > 0;
+
+	const commentIds: string[] = [];
+	if (commentsRes.ok) {
+		const comments = (await commentsRes.json()) as Array<{ id: number }>;
+		for (const c of comments) commentIds.push(String(c.id));
+	}
+
+	return {
+		approvals: approvalsCount,
+		requiredApprovals,
+		fullyApproved,
+		commentIds,
+		merged: pr.merged === true,
+		closed: pr.state === "closed" && !pr.merged,
+	};
+}
+
+async function fetchMrState(
+	monitor: PersistedMrMonitor,
+): Promise<MrState | null> {
+	try {
+		return monitor.provider === "gitlab"
+			? await fetchGitLabMrState(monitor)
+			: await fetchGitHubPrState(monitor);
+	} catch {
+		return null;
+	}
+}
+
 // ── Helpers ────────────────────────────────────────────────────────────────────
 
 /** OSC 8 terminal hyperlink */
@@ -321,6 +576,7 @@ export default function sessionContextExtension(pi: ExtensionAPI) {
 		context: {},
 		derived: {},
 		monitors: [],
+		mrMonitors: [],
 		monitorCounter: 0,
 	};
 
@@ -334,6 +590,9 @@ export default function sessionContextExtension(pi: ExtensionAPI) {
 
 	// Active pipeline pollers keyed by monitor.key
 	const pipelineTimers = new Map<string, ReturnType<typeof setInterval>>();
+
+	// Active MR pollers keyed by monitor.key
+	const mrMonitorTimers = new Map<string, ReturnType<typeof setInterval>>();
 
 	// The most recently seen ctx — used by polling callbacks outside event handlers
 	let savedCtx: ExtensionContext | null = null;
@@ -518,6 +777,160 @@ export default function sessionContextExtension(pi: ExtensionAPI) {
 		for (const key of [...pipelineTimers.keys()]) stopPoller(key);
 	}
 
+	// ── MR Monitor polling ───────────────────────────────────────────────
+
+	function stopMrPoller(key: string): void {
+		const t = mrMonitorTimers.get(key);
+		if (t !== undefined) {
+			clearInterval(t);
+			mrMonitorTimers.delete(key);
+		}
+	}
+
+	function stopAllMrPollers(): void {
+		for (const key of [...mrMonitorTimers.keys()]) stopMrPoller(key);
+	}
+
+	function buildApprovalLabel(monitor: PersistedMrMonitor): string {
+		if (monitor.requiredApprovals === 0) return "";
+		if (monitor.requiredApprovals < 0) return `${monitor.approvals}/?`;
+		return `${monitor.approvals}/${monitor.requiredApprovals}`;
+	}
+
+	function startMrPoller(monitor: PersistedMrMonitor): void {
+		stopMrPoller(monitor.key);
+
+		const handle = setInterval(async () => {
+			if (!savedCtx) return;
+
+			const mrState = await fetchMrState(monitor);
+			const entry = state.context[monitor.key];
+
+			if (!mrState) {
+				if (monitor.mrStatus !== "fetch_error") {
+					monitor.mrStatus = "fetch_error";
+					if (entry) entry.icon = MR_STATUS_ICON.fetch_error;
+					persist();
+					refreshStatus(savedCtx);
+				}
+				return;
+			}
+
+			// Stop polling when MR reaches a terminal state
+			if (mrState.merged || mrState.closed) {
+				const terminalStatus: MrMonitorStatus = mrState.merged
+					? "merged"
+					: "closed";
+				stopMrPoller(monitor.key);
+				monitor.mrStatus = terminalStatus;
+				if (entry) {
+					entry.icon = MR_STATUS_ICON[terminalStatus];
+					entry.label = `${monitor.label}  ${terminalStatus}`;
+				}
+				persist();
+				refreshStatus(savedCtx);
+				if (savedCtx.hasUI) {
+					savedCtx.ui.notify(
+						`${MR_STATUS_ICON[terminalStatus]} ${monitor.label} — ${terminalStatus}`,
+						"info",
+					);
+				}
+				return;
+			}
+
+			let changed = false;
+
+			// Detect new source-code comments
+			const newIds = mrState.commentIds.filter(
+				(id) => !monitor.seenCommentIds.includes(id),
+			);
+			if (newIds.length > 0) {
+				monitor.seenCommentIds.push(...newIds);
+				monitor.mrStatus = "new_comments";
+				changed = true;
+				if (entry) entry.icon = MR_STATUS_ICON.new_comments;
+				if (savedCtx.hasUI) {
+					savedCtx.ui.notify(
+						`💬 ${monitor.label} — ${newIds.length} new code review comment(s)`,
+						"info",
+					);
+				}
+				if (monitor.autoPrompt && savedCtx.hasUI) {
+					const prompt = `The \`${monitor.label}\` MR has ${newIds.length} new code review comment(s).\nMR: ${monitor.url}`;
+					try {
+						if (savedCtx.isIdle()) {
+							pi.sendUserMessage(prompt);
+						} else {
+							pi.sendUserMessage(prompt, { deliverAs: "followUp" });
+						}
+					} catch {
+						// ignore
+					}
+				}
+			}
+
+			// Detect approval changes
+			const prevApprovals = monitor.approvals;
+			const prevRequired = monitor.requiredApprovals;
+			const wasApproved = monitor.fullyApproved;
+			monitor.approvals = mrState.approvals;
+			if (mrState.requiredApprovals !== -1)
+				monitor.requiredApprovals = mrState.requiredApprovals;
+			monitor.fullyApproved = mrState.fullyApproved;
+			if (
+				prevApprovals !== monitor.approvals ||
+				prevRequired !== monitor.requiredApprovals
+			)
+				changed = true;
+
+			// Update footer label with current approval ratio
+			const approvalSuffix = buildApprovalLabel(monitor);
+			if (entry) {
+				const newLabel = `${monitor.label}${approvalSuffix ? `  ${approvalSuffix}` : ""}`;
+				if (entry.label !== newLabel) {
+					entry.label = newLabel;
+					changed = true;
+				}
+			}
+
+			// Notify + auto-prompt when fully approved for the first time
+			if (!wasApproved && monitor.fullyApproved) {
+				monitor.mrStatus = "approved";
+				if (entry) entry.icon = MR_STATUS_ICON.approved;
+				changed = true;
+				const req =
+					monitor.requiredApprovals >= 0
+						? String(monitor.requiredApprovals)
+						: "?";
+				if (savedCtx.hasUI) {
+					savedCtx.ui.notify(
+						`✅ ${monitor.label} — approved (${monitor.approvals}/${req})`,
+						"info",
+					);
+				}
+				if (monitor.autoPrompt && savedCtx.hasUI) {
+					const prompt = `The \`${monitor.label}\` MR has been approved (${monitor.approvals}/${req}).\nMR: ${monitor.url}`;
+					try {
+						if (savedCtx.isIdle()) {
+							pi.sendUserMessage(prompt);
+						} else {
+							pi.sendUserMessage(prompt, { deliverAs: "followUp" });
+						}
+					} catch {
+						// ignore
+					}
+				}
+			}
+
+			if (changed) {
+				persist();
+				refreshStatus(savedCtx);
+			}
+		}, monitor.intervalSeconds * 1000);
+
+		mrMonitorTimers.set(monitor.key, handle);
+	}
+
 	function startPoller(monitor: PersistedMonitor): void {
 		stopPoller(monitor.key); // clear any existing timer for this key
 
@@ -579,9 +992,11 @@ export default function sessionContextExtension(pi: ExtensionAPI) {
 		) {
 			// Fresh context — stop pollers and wipe state
 			stopAllPollers();
+			stopAllMrPollers();
 			state.context = {};
 			state.derived = {};
 			state.monitors = [];
+			state.mrMonitors = [];
 			state.monitorCounter = 0;
 
 			if (ctx.cwd.startsWith(`${WORKTREE_BASE}/`)) {
@@ -608,6 +1023,7 @@ export default function sessionContextExtension(pi: ExtensionAPI) {
 			state.context = data.context ?? {};
 			state.derived = data.derived ?? {};
 			state.monitors = data.monitors ?? [];
+			state.mrMonitors = data.mrMonitors ?? [];
 			state.monitorCounter = data.monitorCounter ?? 0;
 		}
 
@@ -615,6 +1031,13 @@ export default function sessionContextExtension(pi: ExtensionAPI) {
 		for (const monitor of state.monitors) {
 			if (!isTerminal(monitor.status)) {
 				startPoller(monitor);
+			}
+		}
+
+		// Restart MR pollers for active monitors
+		for (const monitor of state.mrMonitors) {
+			if (monitor.mrStatus !== "merged" && monitor.mrStatus !== "closed") {
+				startMrPoller(monitor);
 			}
 		}
 
@@ -627,6 +1050,7 @@ export default function sessionContextExtension(pi: ExtensionAPI) {
 
 	pi.on("session_shutdown", async () => {
 		stopAllPollers();
+		stopAllMrPollers();
 		savedCtx = null;
 	});
 
@@ -890,21 +1314,35 @@ export default function sessionContextExtension(pi: ExtensionAPI) {
 		}),
 
 		async execute(_id, params, _signal, _onUpdate, ctx) {
-			const monitor = state.monitors.find(
+			const pipelineMonitor = state.monitors.find(
 				(m) => m.label.toLowerCase() === params.label.toLowerCase(),
 			);
+			const mrMonitor = state.mrMonitors.find(
+				(m) => m.label.toLowerCase() === params.label.toLowerCase(),
+			);
+			const monitor = pipelineMonitor ?? mrMonitor;
 
 			if (!monitor) {
 				const available =
-					state.monitors.map((m) => m.label).join(", ") || "none";
+					[
+						...state.monitors.map((m) => m.label),
+						...state.mrMonitors.map((m) => m.label),
+					].join(", ") || "none";
 				throw new Error(
 					`No monitor found with label "${params.label}". Active monitors: ${available}`,
 				);
 			}
 
-			stopPoller(monitor.key);
+			if (pipelineMonitor) {
+				stopPoller(monitor.key);
+				state.monitors = state.monitors.filter((m) => m.key !== monitor.key);
+			} else {
+				stopMrPoller(monitor.key);
+				state.mrMonitors = state.mrMonitors.filter(
+					(m) => m.key !== monitor.key,
+				);
+			}
 			delete state.context[monitor.key];
-			state.monitors = state.monitors.filter((m) => m.key !== monitor.key);
 			persist();
 			refreshStatus(ctx);
 
@@ -957,6 +1395,188 @@ export default function sessionContextExtension(pi: ExtensionAPI) {
 			refreshStatus(ctx);
 
 			ctx.ui.notify(`Removed monitor: ${monitor.label}`, "info");
+		},
+	});
+
+	// ── monitor_mr tool ───────────────────────────────────────────────
+
+	pi.registerTool({
+		name: "monitor_mr",
+		label: "Monitor MR",
+		description:
+			"Monitor a GitLab MR or GitHub PR for new code review comments and approval status. " +
+			"Adds a live entry to the footer showing current approvals (x/y). " +
+			"Notifies and optionally auto-prompts when new source-code comments appear or " +
+			"when all required approvals are met. Also detects merged/closed.\n\n" +
+			"Supported URL formats:\n" +
+			"  GitLab MR:  https://<host>/group/project/-/merge_requests/IID\n" +
+			"  GitHub PR:  https://github.com/owner/repo/pull/NUMBER\n\n" +
+			"Required env vars: GITLAB_TOKEN (GitLab), GITHUB_TOKEN (GitHub)\n\n" +
+			"Set auto_prompt: false to suppress automatic agent prompts on activity.",
+		promptSnippet:
+			"Monitor a GitLab MR or GitHub PR for review comments and approvals",
+		promptGuidelines: [
+			"Call monitor_mr after opening or sharing a merge request to track review activity",
+			"Use a short descriptive label matching the MR topic or ticket number",
+			"Default poll interval is 5 minutes — well suited for MR review cycles",
+			"Set auto_prompt: false if you only want footer updates without agent interruptions",
+		],
+		parameters: Type.Object({
+			url: Type.String({
+				description:
+					"Full GitLab MR URL (…/-/merge_requests/IID) or GitHub PR URL (…/pull/NUMBER)",
+			}),
+			label: Type.String({
+				description:
+					"Short display name shown in the footer, e.g. 'my-feature' or 'SDK-1234'",
+			}),
+			interval_seconds: Type.Optional(
+				Type.Number({
+					description: "Poll interval in seconds (default: 300, min: 60)",
+				}),
+			),
+			auto_prompt: Type.Optional(
+				Type.Boolean({
+					description:
+						"When true (default), automatically sends a user message to the agent " +
+						"when new code review comments appear or all required approvals are met. " +
+						"Set to false for silent footer-only updates.",
+				}),
+			),
+		}),
+
+		async execute(_id, params, _signal, _onUpdate, ctx) {
+			savedCtx = ctx;
+
+			const parsed = parseMrUrl(params.url);
+			if (!parsed) {
+				throw new Error(
+					"Unrecognized URL format. Expected:\n" +
+						"  GitLab MR:  https://<host>/group/project/-/merge_requests/IID\n" +
+						"  GitHub PR:  https://github.com/owner/repo/pull/NUMBER",
+				);
+			}
+
+			const key = `mr-${++state.monitorCounter}`;
+			const intervalSeconds = Math.max(60, params.interval_seconds ?? 300);
+
+			const monitor: PersistedMrMonitor = {
+				key,
+				label: params.label,
+				url: params.url,
+				provider: parsed.provider,
+				gitlabHost: parsed.gitlabHost,
+				projectEncoded: parsed.projectEncoded,
+				mrIid: parsed.mrIid,
+				owner: parsed.owner,
+				repo: parsed.repo,
+				prNumber: parsed.prNumber,
+				approvals: 0,
+				requiredApprovals: -1,
+				fullyApproved: false,
+				seenCommentIds: [],
+				mrStatus: "monitoring",
+				intervalSeconds,
+				autoPrompt: params.auto_prompt ?? true,
+			};
+
+			// Fetch initial state — all existing comments are marked as already seen
+			const initial = await fetchMrState(monitor);
+			if (initial) {
+				monitor.approvals = initial.approvals;
+				monitor.requiredApprovals = initial.requiredApprovals;
+				monitor.fullyApproved = initial.fullyApproved;
+				monitor.seenCommentIds = initial.commentIds;
+				if (initial.merged) monitor.mrStatus = "merged";
+				else if (initial.closed) monitor.mrStatus = "closed";
+				else if (initial.fullyApproved) monitor.mrStatus = "approved";
+			}
+
+			const approvalSuffix = buildApprovalLabel(monitor);
+			state.context[key] = {
+				type: "link",
+				value: params.url,
+				icon: MR_STATUS_ICON[monitor.mrStatus],
+				label: `${params.label}${approvalSuffix ? `  ${approvalSuffix}` : ""}`,
+			};
+
+			state.mrMonitors.push(monitor);
+			persist();
+			refreshStatus(ctx);
+
+			const isTerminalMr =
+				monitor.mrStatus === "merged" || monitor.mrStatus === "closed";
+			if (!isTerminalMr) startMrPoller(monitor);
+
+			const req =
+				monitor.requiredApprovals >= 0
+					? String(monitor.requiredApprovals)
+					: "?";
+			const statusMsg = isTerminalMr
+				? `already ${monitor.mrStatus} — no polling needed`
+				: `polling every ${intervalSeconds}s`;
+
+			return {
+				content: [
+					{
+						type: "text",
+						text: `Monitoring ${monitor.label} (${monitor.approvals}/${req} approvals, ${monitor.seenCommentIds.length} existing comments, ${statusMsg}).`,
+					},
+				],
+				details: {
+					key,
+					label: monitor.label,
+					approvals: monitor.approvals,
+					requiredApprovals: monitor.requiredApprovals,
+					existingComments: monitor.seenCommentIds.length,
+					url: monitor.url,
+					provider: monitor.provider,
+					intervalSeconds,
+				},
+			};
+		},
+	});
+
+	// ── /mr-monitors command ────────────────────────────────────────────
+
+	pi.registerCommand("mr-monitors", {
+		description: "List active MR/PR monitors — select one to remove it",
+		handler: async (_args, ctx) => {
+			if (!ctx.hasUI) return;
+
+			if (state.mrMonitors.length === 0) {
+				ctx.ui.notify("No active MR monitors", "info");
+				return;
+			}
+
+			const options = state.mrMonitors.map((m) => {
+				const suffix = buildApprovalLabel(m);
+				return `${MR_STATUS_ICON[m.mrStatus]} ${m.label}${suffix ? `  ${suffix}` : ""}  ${m.mrStatus}`;
+			});
+
+			const choice = await ctx.ui.select(
+				"MR monitors — pick one to remove:",
+				options,
+			);
+			if (!choice) return;
+
+			const idx = options.indexOf(choice);
+			const monitor = state.mrMonitors[idx];
+			if (!monitor) return;
+
+			const confirmed = await ctx.ui.confirm(
+				"Remove monitor?",
+				`Stop tracking ${monitor.label} and remove it from the footer.`,
+			);
+			if (!confirmed) return;
+
+			stopMrPoller(monitor.key);
+			delete state.context[monitor.key];
+			state.mrMonitors = state.mrMonitors.filter((m) => m.key !== monitor.key);
+			persist();
+			refreshStatus(ctx);
+
+			ctx.ui.notify(`Removed MR monitor: ${monitor.label}`, "info");
 		},
 	});
 }
