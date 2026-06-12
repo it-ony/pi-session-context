@@ -1,12 +1,12 @@
 # pi-session-context
 
-A [pi coding agent](https://github.com/mariozechner/pi-coding-agent) extension that tracks and displays what the agent is working on in the footer — worktree, Jira ticket, GitLab/GitHub MR, pipeline status, or any custom key.
+A [pi coding agent](https://github.com/mariozechner/pi-coding-agent) extension that tracks and displays what the agent is working on in the footer — worktree, Jira ticket, GitLab/GitHub MR, pipeline status, MR review activity, or any custom key.
 
 ```
-🌿 my-repo  feat/SDK-1234-fix-auth   📋 SDK-1234   🔀 #771   🟡 deploy
+🌿 my-repo  feat/SDK-1234-fix-auth   📋 SDK-1234   🔀 #771   🟡 deploy   🔍 deploy  1/2
 ```
 
-Entries are clickable OSC 8 hyperlinks in supported terminals. Pipeline icons update automatically as the build progresses.
+Entries are clickable OSC 8 hyperlinks in supported terminals. Pipeline and MR monitor icons update automatically as status changes.
 
 ## How it works
 
@@ -131,11 +131,14 @@ Renders as: `🌐 env  staging   🎯 target  develop`
 
 Use `monitor_pipeline` after triggering a CI/CD pipeline. The extension fetches the status immediately, shows a live clickable badge in the footer, and polls until the pipeline finishes. A pi notification fires on completion.
 
+When the pipeline **fails**, the extension automatically injects a user message so the agent responds without manual intervention. Set `auto_prompt: false` to suppress this.
+
 ```json
 {
   "url":              "https://gitlab.com/org/repo/-/pipelines/12345",
   "label":            "deploy",
-  "interval_seconds": 30
+  "interval_seconds": 30,
+  "auto_prompt":      true
 }
 ```
 
@@ -161,57 +164,111 @@ Self-hosted GitLab is supported — any host is accepted.
 | ⏭ | skipped |
 | ⚠️ | fetch error (bad token / network) |
 
-**Removing a monitor:**
+---
 
-- Agent: call `stop_monitor({ label: "deploy" })`
-- User: type `/pipeline-monitors` → interactive list → select → confirm
+### MR / PR monitoring
+
+Use `monitor_mr` after opening a merge request to track review activity without polling manually. The extension polls every 5 minutes (configurable) and updates the footer with the live approval ratio.
+
+```json
+{
+  "url":              "https://gitlab.example.com/myorg/my-repo/-/merge_requests/771",
+  "label":            "deploy",
+  "interval_seconds": 300,
+  "auto_prompt":      true
+}
+```
+
+**Supported URL formats:**
+
+| Platform | Pattern |
+|----------|---------|
+| GitLab MR | `https://<host>/group/project/-/merge_requests/IID` |
+| GitHub PR | `https://github.com/owner/repo/pull/NUMBER` |
+
+**What is tracked:**
+
+| Event | Footer | Notification | Auto-prompt |
+|-------|--------|--------------|-------------|
+| New source-code (diff) comments | `💬 deploy  1/2` | ✅ | ✅ (if `auto_prompt: true`) |
+| All required approvals met | `✅ deploy  2/2` | ✅ | ✅ (if `auto_prompt: true`) |
+| Approval count changes | `🔍 deploy  1/2 → 2/2` | — | — |
+| MR merged | `🎉 deploy  merged` | ✅ | — |
+| MR closed | `🚫 deploy  closed` | ✅ | — |
+
+**Approval ratio** — displayed as `x/y` in the footer label:
+- GitLab: sourced from the `/approvals` endpoint (`approved_by` / `approvals_required`)
+- GitHub: unique approvers from `/reviews`; required count from branch protection (cached after first fetch, shown as `x/?` if unavailable)
+
+**Comment tracking:** only source-code / diff comments count (inline review threads). General MR description comments are ignored. All comments present at registration are marked as already seen — only comments added after `monitor_mr` is called trigger notifications.
+
+**Status icons:**
+
+| Icon | Status |
+|------|--------|
+| 🔍 | monitoring |
+| 💬 | new comments detected |
+| ✅ | fully approved |
+| 🎉 | merged |
+| 🚫 | closed |
+| ⚠️ | fetch error |
+
+---
+
+### Removing monitors
+
+`stop_monitor` works for **both** pipeline and MR monitors — identify by label:
+
+```json
+{ "label": "deploy" }
+```
+
+Interactive removal via slash commands:
+
+| Command | Covers |
+|---------|--------|
+| `/pipeline-monitors` | Pipeline monitors |
+| `/mr-monitors` | MR / PR monitors |
 
 ---
 
 ### Putting it all together
 
-A typical agent call when starting work on a ticket:
+A typical full workflow — start work, open MR, monitor pipeline and reviews:
 
 ```json
+// set_context — starting work
 {
   "context": {
-    "worktree": {
-      "value": "~/Development/worktree/my-repo/feat/SDK-1234-fix-auth",
-      "type": "dir",
-      "icon": "🌿"
-    },
-    "ticket": {
-      "value": "https://myorg.atlassian.net/browse/SDK-1234",
-      "type": "link",
-      "icon": "📋"
-    }
-  }
-}
-```
-
-After pushing and opening the MR, add it. Then kick off CI and monitor it:
-
-```json
-{
-  "context": {
-    "mr": {
-      "value": "https://gitlab.example.com/myorg/my-repo/-/merge_requests/771",
-      "type": "link",
-      "icon": "🔀"
-    }
+    "worktree": { "value": "~/Development/worktree/my-repo/feat/SDK-1234-fix-auth", "type": "dir" },
+    "ticket":   { "value": "https://myorg.atlassian.net/browse/SDK-1234", "type": "link" }
   }
 }
 ```
 
 ```json
-// monitor_pipeline
+// set_context — after MR is opened
 {
-  "url":   "https://gitlab.example.com/myorg/my-repo/-/pipelines/12345",
+  "context": {
+    "mr": { "value": "https://gitlab.example.com/myorg/my-repo/-/merge_requests/771", "type": "link" }
+  }
+}
+```
+
+```json
+// monitor_pipeline — after push
+{ "url": "https://gitlab.example.com/myorg/my-repo/-/pipelines/12345", "label": "deploy" }
+```
+
+```json
+// monitor_mr — track review activity
+{
+  "url":   "https://gitlab.example.com/myorg/my-repo/-/merge_requests/771",
   "label": "deploy"
 }
 ```
 
-Footer: `🌿 my-repo  feat/…   📋 SDK-1234   🔀 #771   🟡 deploy`
+Footer: `🌿 my-repo  feat/…   📋 SDK-1234   🔀 #771   🟡 deploy   🔍 deploy  0/2`
 
 When the task is done, clear everything:
 
@@ -225,10 +282,8 @@ When the task is done, clear everything:
 }
 ```
 
-Stop any remaining monitors:
-
 ```json
-// stop_monitor
+// stop_monitor — removes both pipeline and MR monitors by label
 { "label": "deploy" }
 ```
 
