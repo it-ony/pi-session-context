@@ -193,7 +193,7 @@ Use `monitor_mr` after opening a merge request to track review activity without 
 | New source-code (diff) comments | `💬 deploy  1/2` | ✅ | ✅ (if `auto_prompt: true`) |
 | All required approvals met | `✅ deploy  2/2` | ✅ | ✅ (if `auto_prompt: true`) |
 | Approval count changes | `🔍 deploy  1/2 → 2/2` | — | — |
-| MR merged | `🎉 deploy  merged` | ✅ | — |
+| MR merged | `🎉 deploy  merged` | ✅ | ✅ (if `auto_prompt_merged: true`) |
 | MR closed | `🚫 deploy  closed` | ✅ | — |
 
 **Approval ratio** — displayed as `x/y` in the footer label:

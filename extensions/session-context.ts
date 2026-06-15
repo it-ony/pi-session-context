@@ -201,6 +201,7 @@ interface PersistedMrMonitor {
 	mrStatus: MrMonitorStatus;
 	intervalSeconds: number;
 	autoPrompt: boolean;
+	autoPromptMerged: boolean;
 }
 
 interface PersistedState {
@@ -835,6 +836,18 @@ export default function sessionContextExtension(pi: ExtensionAPI) {
 						"info",
 					);
 				}
+				if (mrState.merged && monitor.autoPromptMerged && savedCtx.hasUI) {
+					const prompt = `The \`${monitor.label}\` MR has been merged.\nMR: ${monitor.url}`;
+					try {
+						if (savedCtx.isIdle()) {
+							pi.sendUserMessage(prompt);
+						} else {
+							pi.sendUserMessage(prompt, { deliverAs: "followUp" });
+						}
+					} catch {
+						// ignore
+					}
+				}
 				return;
 			}
 
@@ -1443,6 +1456,13 @@ export default function sessionContextExtension(pi: ExtensionAPI) {
 						"Set to false for silent footer-only updates.",
 				}),
 			),
+			auto_prompt_merged: Type.Optional(
+				Type.Boolean({
+					description:
+						"When true (default), automatically sends a user message to the agent " +
+						"when the MR is merged. Set to false to suppress this.",
+				}),
+			),
 		}),
 
 		async execute(_id, params, _signal, _onUpdate, ctx) {
@@ -1478,6 +1498,7 @@ export default function sessionContextExtension(pi: ExtensionAPI) {
 				mrStatus: "monitoring",
 				intervalSeconds,
 				autoPrompt: params.auto_prompt ?? true,
+				autoPromptMerged: params.auto_prompt_merged ?? true,
 			};
 
 			// Fetch initial state — all existing comments are marked as already seen
