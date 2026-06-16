@@ -168,13 +168,13 @@ Self-hosted GitLab is supported — any host is accepted.
 
 ### MR / PR monitoring
 
-Use `monitor_mr` after opening a merge request to track review activity without polling manually. The extension polls every 5 minutes (configurable) and updates the footer with the live approval ratio.
+Use `monitor_mr` after opening a merge request to track review activity without polling manually. The extension polls every 1 minute by default (configurable, min 15s) and updates the footer with the live approval ratio.
 
 ```json
 {
   "url":              "https://gitlab.example.com/myorg/my-repo/-/merge_requests/771",
   "label":            "deploy",
-  "interval_seconds": 300,
+  "interval_seconds": 60,
   "auto_prompt":      true
 }
 ```

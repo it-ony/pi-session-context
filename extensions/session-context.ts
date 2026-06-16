@@ -1444,7 +1444,7 @@ export default function sessionContextExtension(pi: ExtensionAPI) {
 		promptGuidelines: [
 			"Call monitor_mr after opening or sharing a merge request to track review activity",
 			"Use a short descriptive label matching the MR topic or ticket number",
-			"Default poll interval is 5 minutes — well suited for MR review cycles",
+			"Default poll interval is 1 minute — set lower (min 15s) for faster feedback",
 			"Set auto_prompt: false if you only want footer updates without agent interruptions",
 		],
 		parameters: Type.Object({
@@ -1458,7 +1458,7 @@ export default function sessionContextExtension(pi: ExtensionAPI) {
 			}),
 			interval_seconds: Type.Optional(
 				Type.Number({
-					description: "Poll interval in seconds (default: 300, min: 60)",
+					description: "Poll interval in seconds (default: 60, min: 15)",
 				}),
 			),
 			auto_prompt: Type.Optional(
@@ -1491,7 +1491,7 @@ export default function sessionContextExtension(pi: ExtensionAPI) {
 			}
 
 			const key = `mr-${++state.monitorCounter}`;
-			const intervalSeconds = Math.max(60, params.interval_seconds ?? 300);
+			const intervalSeconds = Math.max(15, params.interval_seconds ?? 60);
 
 			const monitor: PersistedMrMonitor = {
 				key,
