@@ -387,10 +387,9 @@ async function fetchGitLabMrState(
 	const token = process.env.GITLAB_TOKEN;
 	if (token) headers["PRIVATE-TOKEN"] = token;
 
-	const [mrRes, approvalsRes, discussionsRes] = await Promise.all([
+	const [mrRes, approvalsRes] = await Promise.all([
 		fetch(base, { headers }),
 		fetch(`${base}/approvals`, { headers }),
-		fetch(`${base}/discussions?per_page=100`, { headers }),
 	]);
 
 	if (!mrRes.ok) throw new Error(`MR fetch failed: ${mrRes.status}`);
@@ -407,23 +406,31 @@ async function fetchGitLabMrState(
 		requiredApprovals = appData.approvals_required;
 	}
 
+	// Paginate through all discussions — GitLab caps at 100 per page
 	const commentIds: string[] = [];
-	if (discussionsRes.ok) {
-		const discussions = (await discussionsRes.json()) as Array<{
+	let page = 1;
+	while (true) {
+		const res = await fetch(`${base}/discussions?per_page=100&page=${page}`, {
+			headers,
+		});
+		if (!res.ok) break;
+		const discussions = (await res.json()) as Array<{
 			notes: Array<{
 				id: number;
+				type: string | null; // "DiffNote" for inline code comments
 				system: boolean;
-				position: Record<string, unknown> | null;
 			}>;
 		}>;
 		for (const disc of discussions) {
 			const first = disc.notes[0];
-			// Diff discussions have a position on the first note
-			if (!first || first.system || first.position === null) continue;
+			// Only inline diff discussions — "DiffNote" is the reliable marker
+			if (!first || first.system || first.type !== "DiffNote") continue;
 			for (const note of disc.notes) {
 				if (!note.system) commentIds.push(String(note.id));
 			}
 		}
+		if (discussions.length < 100) break; // last page
+		page++;
 	}
 
 	return {
@@ -449,12 +456,9 @@ async function fetchGitHubPrState(
 	const token = process.env.GITHUB_TOKEN;
 	if (token) headers.Authorization = `Bearer ${token}`;
 
-	const [prRes, reviewsRes, commentsRes] = await Promise.all([
+	const [prRes, reviewsRes] = await Promise.all([
 		fetch(`${base}/pulls/${monitor.prNumber}`, { headers }),
 		fetch(`${base}/pulls/${monitor.prNumber}/reviews?per_page=100`, {
-			headers,
-		}),
-		fetch(`${base}/pulls/${monitor.prNumber}/comments?per_page=100`, {
 			headers,
 		}),
 	]);
@@ -514,10 +518,19 @@ async function fetchGitHubPrState(
 			? approvalsCount >= requiredApprovals
 			: approvalsCount > 0;
 
+	// Paginate through all review comments (inline diff comments only)
 	const commentIds: string[] = [];
-	if (commentsRes.ok) {
-		const comments = (await commentsRes.json()) as Array<{ id: number }>;
+	let commentPage = 1;
+	while (true) {
+		const res = await fetch(
+			`${base}/pulls/${monitor.prNumber}/comments?per_page=100&page=${commentPage}`,
+			{ headers },
+		);
+		if (!res.ok) break;
+		const comments = (await res.json()) as Array<{ id: number }>;
 		for (const c of comments) commentIds.push(String(c.id));
+		if (comments.length < 100) break;
+		commentPage++;
 	}
 
 	return {
