@@ -131,14 +131,15 @@ Renders as: `🌐 env  staging   🎯 target  develop`
 
 Use `monitor_pipeline` after triggering a CI/CD pipeline. The extension fetches the status immediately, shows a live clickable badge in the footer, and polls until the pipeline finishes. A pi notification fires on completion.
 
-When the pipeline **fails**, the extension automatically injects a user message so the agent responds without manual intervention. Set `auto_prompt: false` to suppress this.
+When the pipeline **fails**, the extension automatically injects a user message so the agent responds without manual intervention. Use `notify_on` to control which terminal statuses trigger a prompt (default: `["failed"]`). Set `auto_prompt: false` to suppress all prompts.
 
 ```json
 {
   "url":              "https://gitlab.com/org/repo/-/pipelines/12345",
   "label":            "deploy",
   "interval_seconds": 30,
-  "auto_prompt":      true
+  "auto_prompt":      true,
+  "notify_on":        ["failed"]
 }
 ```
 

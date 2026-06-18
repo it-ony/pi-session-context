@@ -87,6 +87,13 @@ const STATUS_ICON: Record<PipelineStatus, string> = {
 	fetch_error: "⚠️",
 };
 
+const STATUS_PROMPT_VERB: Partial<Record<PipelineStatus, string>> = {
+	success: "succeeded",
+	failed: "failed",
+	canceled: "was canceled",
+	skipped: "was skipped",
+};
+
 const TERMINAL_STATUSES: ReadonlySet<PipelineStatus> = new Set([
 	"success",
 	"failed",
@@ -167,6 +174,7 @@ interface PersistedMonitor {
 	status: PipelineStatus;
 	intervalSeconds: number;
 	autoPrompt: boolean;
+	notifyOn: PipelineStatus[];
 }
 
 /** State fetched from a single MR / PR poll */
@@ -988,8 +996,13 @@ export default function sessionContextExtension(pi: ExtensionAPI) {
 					);
 				}
 				// Auto-inject a user message so the agent responds to the failure
-				if (newStatus === "failed" && savedCtx.hasUI && monitor.autoPrompt) {
-					const prompt = `The \`${monitor.label}\` pipeline has failed.\nPipeline: ${monitor.url}`;
+				const notifyOn = monitor.notifyOn ?? ["failed"];
+				if (
+					notifyOn.includes(newStatus) &&
+					savedCtx.hasUI &&
+					monitor.autoPrompt
+				) {
+					const prompt = `The \`${monitor.label}\` pipeline ${STATUS_PROMPT_VERB[newStatus] ?? newStatus}.\nPipeline: ${monitor.url}`;
 					try {
 						if (savedCtx.isIdle()) {
 							pi.sendUserMessage(prompt);
@@ -1207,7 +1220,8 @@ export default function sessionContextExtension(pi: ExtensionAPI) {
 			"  GitHub run:       https://github.com/owner/repo/actions/runs/ID\n\n" +
 			"Self-hosted GitLab is supported — any host is accepted.\n\n" +
 			"Required env vars: GITLAB_TOKEN (GitLab), GITHUB_TOKEN (GitHub)\n\n" +
-			"Set auto_prompt: false to suppress the automatic failure prompt.",
+			"Set auto_prompt: false to suppress all agent prompts. " +
+			'Use notify_on to control which terminal statuses trigger a prompt (default: ["failed"]).',
 		promptSnippet:
 			"Monitor a GitLab/GitHub pipeline or job — live icon in the footer",
 		promptGuidelines: [
@@ -1235,6 +1249,21 @@ export default function sessionContextExtension(pi: ExtensionAPI) {
 						"When true (default), automatically sends a user message to the agent if the pipeline fails, " +
 						"triggering a response. Set to false to suppress this behaviour.",
 				}),
+			),
+			notify_on: Type.Optional(
+				Type.Array(
+					Type.Union([
+						Type.Literal("success"),
+						Type.Literal("failed"),
+						Type.Literal("canceled"),
+						Type.Literal("skipped"),
+					]),
+					{
+						description:
+							"Terminal statuses that trigger an agent prompt. " +
+							'Default: ["failed"]. Pass ["failed", "success"] to also prompt on success.',
+					},
+				),
 			),
 		}),
 
@@ -1266,6 +1295,9 @@ export default function sessionContextExtension(pi: ExtensionAPI) {
 				status: "pending",
 				intervalSeconds,
 				autoPrompt: params.auto_prompt ?? true,
+				notifyOn: (params.notify_on as PipelineStatus[] | undefined) ?? [
+					"failed",
+				],
 			};
 
 			// Fetch initial status before showing in footer
@@ -1291,8 +1323,9 @@ export default function sessionContextExtension(pi: ExtensionAPI) {
 					`${STATUS_ICON[monitor.status]} ${monitor.label} — ${monitor.status}`,
 					monitor.status === "success" ? "info" : "error",
 				);
-				if (monitor.status === "failed" && monitor.autoPrompt) {
-					const prompt = `The \`${monitor.label}\` pipeline has failed.\nPipeline: ${monitor.url}`;
+				const notifyOn = monitor.notifyOn ?? ["failed"];
+				if (notifyOn.includes(monitor.status) && monitor.autoPrompt) {
+					const prompt = `The \`${monitor.label}\` pipeline ${STATUS_PROMPT_VERB[monitor.status] ?? monitor.status}.\nPipeline: ${monitor.url}`;
 					try {
 						pi.sendUserMessage(prompt, { deliverAs: "followUp" });
 					} catch {
