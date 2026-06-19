@@ -175,6 +175,7 @@ interface PersistedMonitor {
 	intervalSeconds: number;
 	autoPrompt: boolean;
 	notifyOn: PipelineStatus[];
+	includeFailedJobs: boolean;
 }
 
 /** State fetched from a single MR / PR poll */
@@ -379,6 +380,42 @@ async function fetchPipelineStatus(
 				);
 	} catch {
 		return "fetch_error";
+	}
+}
+
+/** Fetch the names of failed jobs for a pipeline monitor. Returns [] for job monitors or on error. */
+async function fetchFailedJobs(monitor: PersistedMonitor): Promise<string[]> {
+	try {
+		const headers: Record<string, string> = {
+			Accept: "application/json",
+			"User-Agent": "pi-session-context/1.0",
+		};
+		if (monitor.provider === "gitlab") {
+			const token = process.env.GITLAB_TOKEN;
+			if (token) headers["PRIVATE-TOKEN"] = token;
+			// Only pipeline monitors have a /jobs sub-resource
+			if (!monitor.apiUrl.includes("/pipelines/")) return [];
+			const res = await fetch(`${monitor.apiUrl}/jobs?scope[]=failed`, {
+				headers,
+			});
+			if (!res.ok) return [];
+			const jobs = (await res.json()) as Array<{ name: string }>;
+			return jobs.map((j) => j.name);
+		}
+		const token = process.env.GITHUB_TOKEN;
+		if (token) headers.Authorization = `Bearer ${token}`;
+		const res = await fetch(`${monitor.apiUrl}/jobs?filter=latest`, {
+			headers,
+		});
+		if (!res.ok) return [];
+		const data = (await res.json()) as {
+			jobs: Array<{ name: string; conclusion: string }>;
+		};
+		return data.jobs
+			.filter((j) => j.conclusion === "failure")
+			.map((j) => j.name);
+	} catch {
+		return [];
 	}
 }
 
@@ -1002,7 +1039,11 @@ export default function sessionContextExtension(pi: ExtensionAPI) {
 					savedCtx.hasUI &&
 					monitor.autoPrompt
 				) {
-					const prompt = `The \`${monitor.label}\` pipeline ${STATUS_PROMPT_VERB[newStatus] ?? newStatus}.\nPipeline: ${monitor.url}`;
+					let prompt = `The \`${monitor.label}\` pipeline ${STATUS_PROMPT_VERB[newStatus] ?? newStatus}.\nPipeline: ${monitor.url}`;
+					if (newStatus === "failed" && (monitor.includeFailedJobs ?? true)) {
+						const jobs = await fetchFailedJobs(monitor);
+						if (jobs.length > 0) prompt += `\nFailed jobs: ${jobs.join(", ")}`;
+					}
 					try {
 						if (savedCtx.isIdle()) {
 							pi.sendUserMessage(prompt);
@@ -1265,6 +1306,13 @@ export default function sessionContextExtension(pi: ExtensionAPI) {
 					},
 				),
 			),
+			include_failed_jobs: Type.Optional(
+				Type.Boolean({
+					description:
+						"When true (default), the failure prompt includes the names of failed jobs. " +
+						"Only applies to pipeline monitors (not individual job monitors).",
+				}),
+			),
 		}),
 
 		async execute(_id, params, _signal, _onUpdate, ctx) {
@@ -1298,6 +1346,7 @@ export default function sessionContextExtension(pi: ExtensionAPI) {
 				notifyOn: (params.notify_on as PipelineStatus[] | undefined) ?? [
 					"failed",
 				],
+				includeFailedJobs: params.include_failed_jobs ?? true,
 			};
 
 			// Fetch initial status before showing in footer
@@ -1325,7 +1374,14 @@ export default function sessionContextExtension(pi: ExtensionAPI) {
 				);
 				const notifyOn = monitor.notifyOn ?? ["failed"];
 				if (notifyOn.includes(monitor.status) && monitor.autoPrompt) {
-					const prompt = `The \`${monitor.label}\` pipeline ${STATUS_PROMPT_VERB[monitor.status] ?? monitor.status}.\nPipeline: ${monitor.url}`;
+					let prompt = `The \`${monitor.label}\` pipeline ${STATUS_PROMPT_VERB[monitor.status] ?? monitor.status}.\nPipeline: ${monitor.url}`;
+					if (
+						monitor.status === "failed" &&
+						(monitor.includeFailedJobs ?? true)
+					) {
+						const jobs = await fetchFailedJobs(monitor);
+						if (jobs.length > 0) prompt += `\nFailed jobs: ${jobs.join(", ")}`;
+					}
 					try {
 						pi.sendUserMessage(prompt, { deliverAs: "followUp" });
 					} catch {
