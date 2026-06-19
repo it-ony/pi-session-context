@@ -176,6 +176,7 @@ interface PersistedMonitor {
 	autoPrompt: boolean;
 	notifyOn: PipelineStatus[];
 	includeFailedJobs: boolean;
+	notifyOnJobFailure: boolean;
 	seenFailedJobNames: string[];
 }
 
@@ -1014,8 +1015,7 @@ export default function sessionContextExtension(pi: ExtensionAPI) {
 			// While running: check for newly failed jobs and prompt immediately
 			if (
 				newStatus === "running" &&
-				(monitor.includeFailedJobs ?? true) &&
-				(monitor.notifyOn ?? ["failed"]).includes("failed") &&
+				(monitor.notifyOnJobFailure ?? false) &&
 				monitor.autoPrompt &&
 				savedCtx.hasUI
 			) {
@@ -1349,6 +1349,14 @@ export default function sessionContextExtension(pi: ExtensionAPI) {
 						"Only applies to pipeline monitors (not individual job monitors).",
 				}),
 			),
+			notify_on_job_failure: Type.Optional(
+				Type.Boolean({
+					description:
+						"When true, immediately notifies and prompts the agent the moment a job fails " +
+						"while the pipeline is still running — without waiting for the pipeline to finish. " +
+						"Defaults to false.",
+				}),
+			),
 		}),
 
 		async execute(_id, params, _signal, _onUpdate, ctx) {
@@ -1383,6 +1391,7 @@ export default function sessionContextExtension(pi: ExtensionAPI) {
 					"failed",
 				],
 				includeFailedJobs: params.include_failed_jobs ?? true,
+				notifyOnJobFailure: params.notify_on_job_failure ?? false,
 				seenFailedJobNames: [],
 			};
 
