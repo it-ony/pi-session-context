@@ -176,6 +176,7 @@ interface PersistedMonitor {
 	autoPrompt: boolean;
 	notifyOn: PipelineStatus[];
 	includeFailedJobs: boolean;
+	seenFailedJobNames: string[];
 }
 
 /** State fetched from a single MR / PR poll */
@@ -1009,6 +1010,38 @@ export default function sessionContextExtension(pi: ExtensionAPI) {
 			if (!savedCtx) return;
 
 			const newStatus = await fetchPipelineStatus(monitor);
+
+			// While running: check for newly failed jobs and prompt immediately
+			if (
+				newStatus === "running" &&
+				(monitor.includeFailedJobs ?? true) &&
+				(monitor.notifyOn ?? ["failed"]).includes("failed") &&
+				monitor.autoPrompt &&
+				savedCtx.hasUI
+			) {
+				const allFailed = await fetchFailedJobs(monitor);
+				const seen = monitor.seenFailedJobNames ?? [];
+				const newlyFailed = allFailed.filter((j) => !seen.includes(j));
+				if (newlyFailed.length > 0) {
+					monitor.seenFailedJobNames = [...seen, ...newlyFailed];
+					persist();
+					savedCtx.ui.notify(
+						`❌ ${monitor.label} — job(s) failed: ${newlyFailed.join(", ")}`,
+						"error",
+					);
+					const prompt = `Job(s) \`${newlyFailed.join("`, `")}\` failed in the \`${monitor.label}\` pipeline (still running).\nPipeline: ${monitor.url}`;
+					try {
+						if (savedCtx.isIdle()) {
+							pi.sendUserMessage(prompt);
+						} else {
+							pi.sendUserMessage(prompt, { deliverAs: "followUp" });
+						}
+					} catch {
+						// ignore
+					}
+				}
+			}
+
 			if (newStatus === monitor.status) return;
 
 			monitor.status = newStatus;
@@ -1042,7 +1075,10 @@ export default function sessionContextExtension(pi: ExtensionAPI) {
 					let prompt = `The \`${monitor.label}\` pipeline ${STATUS_PROMPT_VERB[newStatus] ?? newStatus}.\nPipeline: ${monitor.url}`;
 					if (newStatus === "failed" && (monitor.includeFailedJobs ?? true)) {
 						const jobs = await fetchFailedJobs(monitor);
-						if (jobs.length > 0) prompt += `\nFailed jobs: ${jobs.join(", ")}`;
+						const seen = monitor.seenFailedJobNames ?? [];
+						const unreported = jobs.filter((j) => !seen.includes(j));
+						if (unreported.length > 0)
+							prompt += `\nFailed jobs: ${unreported.join(", ")}`;
 					}
 					try {
 						if (savedCtx.isIdle()) {
@@ -1347,6 +1383,7 @@ export default function sessionContextExtension(pi: ExtensionAPI) {
 					"failed",
 				],
 				includeFailedJobs: params.include_failed_jobs ?? true,
+				seenFailedJobNames: [],
 			};
 
 			// Fetch initial status before showing in footer
@@ -1380,7 +1417,10 @@ export default function sessionContextExtension(pi: ExtensionAPI) {
 						(monitor.includeFailedJobs ?? true)
 					) {
 						const jobs = await fetchFailedJobs(monitor);
-						if (jobs.length > 0) prompt += `\nFailed jobs: ${jobs.join(", ")}`;
+						const seen = monitor.seenFailedJobNames ?? [];
+						const unreported = jobs.filter((j) => !seen.includes(j));
+						if (unreported.length > 0)
+							prompt += `\nFailed jobs: ${unreported.join(", ")}`;
 					}
 					try {
 						pi.sendUserMessage(prompt, { deliverAs: "followUp" });
