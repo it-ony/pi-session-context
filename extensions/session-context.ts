@@ -1522,7 +1522,7 @@ export default function sessionContextExtension(pi: ExtensionAPI) {
 	// ── /monitors command ─────────────────────────────────────────────────────
 
 	pi.registerCommand("pipeline-monitors", {
-		description: "List active pipeline monitors — select one to remove it",
+		description: "List active pipeline monitors — select one to edit or remove",
 		handler: async (_args, ctx) => {
 			if (!ctx.hasUI) return;
 
@@ -1531,34 +1531,105 @@ export default function sessionContextExtension(pi: ExtensionAPI) {
 				return;
 			}
 
-			const options = state.monitors.map(
+			const monitorOptions = state.monitors.map(
 				(m) => `${STATUS_ICON[m.status]} ${m.label}  ${m.status}`,
 			);
-
 			const choice = await ctx.ui.select(
-				"Pipeline monitors — pick one to remove:",
-				options,
+				"Pipeline monitors — pick one:",
+				monitorOptions,
 			);
 			if (!choice) return;
 
-			// Match choice back to monitor by index
-			const idx = options.indexOf(choice);
+			const idx = monitorOptions.indexOf(choice);
 			const monitor = state.monitors[idx];
 			if (!monitor) return;
 
-			const confirmed = await ctx.ui.confirm(
-				"Remove monitor?",
-				`Stop tracking ${monitor.label} and remove it from the footer.`,
+			const action = await ctx.ui.select(
+				`${monitor.label} — what do you want to do?`,
+				["✏️  Edit settings", "🗑️  Remove"],
 			);
-			if (!confirmed) return;
+			if (!action) return;
 
-			stopPoller(monitor.key);
-			delete state.context[monitor.key];
-			state.monitors = state.monitors.filter((m) => m.key !== monitor.key);
-			persist();
-			refreshStatus(ctx);
+			if (action.startsWith("🗑️")) {
+				const confirmed = await ctx.ui.confirm(
+					"Remove monitor?",
+					`Stop tracking ${monitor.label} and remove it from the footer.`,
+				);
+				if (!confirmed) return;
+				stopPoller(monitor.key);
+				delete state.context[monitor.key];
+				state.monitors = state.monitors.filter((m) => m.key !== monitor.key);
+				persist();
+				refreshStatus(ctx);
+				ctx.ui.notify(`Removed monitor: ${monitor.label}`, "info");
+				return;
+			}
 
-			ctx.ui.notify(`Removed monitor: ${monitor.label}`, "info");
+			// Edit settings loop
+			const NOTIFY_STATUSES = [
+				"failed",
+				"success",
+				"canceled",
+				"skipped",
+			] as const;
+			while (true) {
+				const notifyOn = monitor.notifyOn ?? ["failed"];
+				const settingOptions = [
+					`auto_prompt: ${monitor.autoPrompt}`,
+					`notify_on: [${notifyOn.join(", ")}]`,
+					`notify_on_job_failure: ${monitor.notifyOnJobFailure ?? false}`,
+					`include_failed_jobs: ${monitor.includeFailedJobs ?? true}`,
+					`interval_seconds: ${monitor.intervalSeconds}`,
+					"─ Done",
+				];
+				const setting = await ctx.ui.select(
+					`Edit ${monitor.label} — pick a setting:`,
+					settingOptions,
+				);
+				if (!setting || setting.startsWith("─")) break;
+
+				if (setting.startsWith("auto_prompt")) {
+					monitor.autoPrompt = !monitor.autoPrompt;
+				} else if (setting.startsWith("notify_on_job_failure")) {
+					monitor.notifyOnJobFailure = !(monitor.notifyOnJobFailure ?? false);
+				} else if (setting.startsWith("include_failed_jobs")) {
+					monitor.includeFailedJobs = !(monitor.includeFailedJobs ?? true);
+				} else if (setting.startsWith("notify_on")) {
+					// Sub-loop: toggle individual statuses
+					while (true) {
+						const current = monitor.notifyOn ?? ["failed"];
+						const statusOptions = [
+							...NOTIFY_STATUSES.map(
+								(s) => `${current.includes(s) ? "✓" : "○"} ${s}`,
+							),
+							"─ Done",
+						];
+						const statusChoice = await ctx.ui.select(
+							"notify_on — pick to toggle:",
+							statusOptions,
+						);
+						if (!statusChoice || statusChoice.startsWith("─")) break;
+						const status = statusChoice.slice(2) as PipelineStatus;
+						monitor.notifyOn = current.includes(status)
+							? current.filter((s) => s !== status)
+							: [...current, status];
+					}
+				} else if (setting.startsWith("interval_seconds")) {
+					const input = await ctx.ui.input(
+						"interval_seconds (min 5):",
+						String(monitor.intervalSeconds),
+					);
+					if (input) {
+						const val = Number.parseInt(input, 10);
+						if (!Number.isNaN(val)) {
+							monitor.intervalSeconds = Math.max(5, val);
+							if (!isTerminal(monitor.status)) startPoller(monitor);
+						}
+					}
+				}
+				persist();
+				refreshStatus(ctx);
+			}
 		},
 	});
 
@@ -1712,7 +1783,7 @@ export default function sessionContextExtension(pi: ExtensionAPI) {
 	// ── /mr-monitors command ────────────────────────────────────────────
 
 	pi.registerCommand("mr-monitors", {
-		description: "List active MR/PR monitors — select one to remove it",
+		description: "List active MR/PR monitors — select one to edit or remove",
 		handler: async (_args, ctx) => {
 			if (!ctx.hasUI) return;
 
@@ -1721,34 +1792,82 @@ export default function sessionContextExtension(pi: ExtensionAPI) {
 				return;
 			}
 
-			const options = state.mrMonitors.map((m) => {
+			const monitorOptions = state.mrMonitors.map((m) => {
 				const suffix = buildApprovalLabel(m);
 				return `${MR_STATUS_ICON[m.mrStatus]} ${m.label}${suffix ? `  ${suffix}` : ""}  ${m.mrStatus}`;
 			});
-
 			const choice = await ctx.ui.select(
-				"MR monitors — pick one to remove:",
-				options,
+				"MR monitors — pick one:",
+				monitorOptions,
 			);
 			if (!choice) return;
 
-			const idx = options.indexOf(choice);
+			const idx = monitorOptions.indexOf(choice);
 			const monitor = state.mrMonitors[idx];
 			if (!monitor) return;
 
-			const confirmed = await ctx.ui.confirm(
-				"Remove monitor?",
-				`Stop tracking ${monitor.label} and remove it from the footer.`,
+			const action = await ctx.ui.select(
+				`${monitor.label} — what do you want to do?`,
+				["✏️  Edit settings", "🗑️  Remove"],
 			);
-			if (!confirmed) return;
+			if (!action) return;
 
-			stopMrPoller(monitor.key);
-			delete state.context[monitor.key];
-			state.mrMonitors = state.mrMonitors.filter((m) => m.key !== monitor.key);
-			persist();
-			refreshStatus(ctx);
+			if (action.startsWith("🗑️")) {
+				const confirmed = await ctx.ui.confirm(
+					"Remove monitor?",
+					`Stop tracking ${monitor.label} and remove it from the footer.`,
+				);
+				if (!confirmed) return;
+				stopMrPoller(monitor.key);
+				delete state.context[monitor.key];
+				state.mrMonitors = state.mrMonitors.filter(
+					(m) => m.key !== monitor.key,
+				);
+				persist();
+				refreshStatus(ctx);
+				ctx.ui.notify(`Removed MR monitor: ${monitor.label}`, "info");
+				return;
+			}
 
-			ctx.ui.notify(`Removed MR monitor: ${monitor.label}`, "info");
+			// Edit settings loop
+			while (true) {
+				const settingOptions = [
+					`auto_prompt: ${monitor.autoPrompt}`,
+					`auto_prompt_merged: ${monitor.autoPromptMerged}`,
+					`interval_seconds: ${monitor.intervalSeconds}`,
+					"─ Done",
+				];
+				const setting = await ctx.ui.select(
+					`Edit ${monitor.label} — pick a setting:`,
+					settingOptions,
+				);
+				if (!setting || setting.startsWith("─")) break;
+
+				if (setting.startsWith("auto_prompt_merged")) {
+					monitor.autoPromptMerged = !monitor.autoPromptMerged;
+				} else if (setting.startsWith("auto_prompt")) {
+					monitor.autoPrompt = !monitor.autoPrompt;
+				} else if (setting.startsWith("interval_seconds")) {
+					const input = await ctx.ui.input(
+						"interval_seconds (min 15):",
+						String(monitor.intervalSeconds),
+					);
+					if (input) {
+						const val = Number.parseInt(input, 10);
+						if (!Number.isNaN(val)) {
+							monitor.intervalSeconds = Math.max(15, val);
+							if (
+								monitor.mrStatus !== "merged" &&
+								monitor.mrStatus !== "closed"
+							) {
+								startMrPoller(monitor);
+							}
+						}
+					}
+				}
+				persist();
+				refreshStatus(ctx);
+			}
 		},
 	});
 }
