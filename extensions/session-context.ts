@@ -470,8 +470,10 @@ async function fetchGitLabMrState(
 		}>;
 		for (const disc of discussions) {
 			const first = disc.notes[0];
-			// Only inline diff discussions — "DiffNote" is the reliable marker
-			if (!first || first.system || first.type !== "DiffNote") continue;
+			// Track both inline diff comments (DiffNote) and general user comments
+			// (type: null). System notes ("added a commit", "approved this MR", etc.)
+			// are excluded via first.system.
+			if (!first || first.system) continue;
 			for (const note of disc.notes) {
 				if (!note.system) commentIds.push(String(note.id));
 			}
