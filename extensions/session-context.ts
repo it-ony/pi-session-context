@@ -111,6 +111,7 @@ type MrMonitorStatus =
 	| "monitoring"
 	| "approved"
 	| "new_comments"
+	| "needs_rebase"
 	| "merged"
 	| "closed"
 	| "fetch_error";
@@ -119,6 +120,7 @@ const MR_STATUS_ICON: Record<MrMonitorStatus, string> = {
 	monitoring: "🔍",
 	approved: "✅",
 	new_comments: "💬",
+	needs_rebase: "🔁",
 	merged: "🎉",
 	closed: "🚫",
 	fetch_error: "⚠️",
@@ -186,6 +188,7 @@ interface MrState {
 	requiredApprovals: number; // -1 = unknown
 	fullyApproved: boolean;
 	commentIds: string[]; // all source-code comment IDs currently on the MR
+	hasConflicts: boolean; // true when the MR cannot fast-forward/merge cleanly and needs a rebase
 	merged: boolean;
 	closed: boolean;
 }
@@ -209,10 +212,14 @@ interface PersistedMrMonitor {
 	requiredApprovals: number; // -1 = unknown
 	fullyApproved: boolean;
 	seenCommentIds: string[];
+	/** true once we've already prompted the agent about the current conflict; reset when conflicts clear */
+	conflictNotified: boolean;
 	mrStatus: MrMonitorStatus;
 	intervalSeconds: number;
 	autoPrompt: boolean;
 	autoPromptMerged: boolean;
+	/** when true, the agent auto-rebases (fetch + rebase + force-push) as soon as conflicts are detected */
+	autoRebase: boolean;
 }
 
 interface PersistedState {
@@ -440,7 +447,7 @@ async function fetchGitLabMrState(
 	]);
 
 	if (!mrRes.ok) throw new Error(`MR fetch failed: ${mrRes.status}`);
-	const mr = (await mrRes.json()) as { state: string };
+	const mr = (await mrRes.json()) as { state: string; has_conflicts?: boolean };
 
 	let approvalsCount = 0;
 	let requiredApprovals = 0;
@@ -488,6 +495,7 @@ async function fetchGitLabMrState(
 		fullyApproved:
 			requiredApprovals === 0 || approvalsCount >= requiredApprovals,
 		commentIds,
+		hasConflicts: mr.has_conflicts === true,
 		merged: mr.state === "merged",
 		closed: mr.state === "closed",
 	};
@@ -517,6 +525,7 @@ async function fetchGitHubPrState(
 		state: string;
 		merged: boolean;
 		base: { ref: string };
+		mergeable_state?: string; // "dirty" = has conflicts (GitHub computes this async, may be null)
 	};
 
 	// Count unique approvers — last review state per user wins
@@ -587,6 +596,7 @@ async function fetchGitHubPrState(
 		requiredApprovals,
 		fullyApproved,
 		commentIds,
+		hasConflicts: pr.mergeable_state === "dirty",
 		merged: pr.merged === true,
 		closed: pr.state === "closed" && !pr.merged,
 	};
@@ -914,6 +924,38 @@ export default function sessionContextExtension(pi: ExtensionAPI) {
 			}
 
 			let changed = false;
+
+			// Detect rebase-needed (conflicts with the target branch)
+			if (mrState.hasConflicts && !monitor.conflictNotified) {
+				monitor.conflictNotified = true;
+				monitor.mrStatus = "needs_rebase";
+				changed = true;
+				if (entry) entry.icon = MR_STATUS_ICON.needs_rebase;
+				if (savedCtx.hasUI) {
+					savedCtx.ui.notify(
+						`🔁 ${monitor.label} — needs rebase (conflicts with target branch)`,
+						"error",
+					);
+				}
+				if (monitor.autoPrompt && savedCtx.hasUI) {
+					const prompt = monitor.autoRebase
+						? `The \`${monitor.label}\` MR has conflicts with the target branch. Rebase it now (fetch, rebase onto the target branch, resolve conflicts, force-push with --force-with-lease), then keep monitoring.\nMR: ${monitor.url}`
+						: `The \`${monitor.label}\` MR has conflicts with the target branch and needs a rebase.\nMR: ${monitor.url}`;
+					try {
+						if (savedCtx.isIdle()) {
+							pi.sendUserMessage(prompt);
+						} else {
+							pi.sendUserMessage(prompt, { deliverAs: "followUp" });
+						}
+					} catch {
+						// ignore
+					}
+				}
+			} else if (!mrState.hasConflicts && monitor.conflictNotified) {
+				// Conflicts cleared (e.g. rebase landed) — re-arm for next time
+				monitor.conflictNotified = false;
+				changed = true;
+			}
 
 			// Detect new source-code comments
 			const newIds = mrState.commentIds.filter(
@@ -1643,20 +1685,24 @@ export default function sessionContextExtension(pi: ExtensionAPI) {
 		description:
 			"Monitor a GitLab MR or GitHub PR for new code review comments and approval status. " +
 			"Adds a live entry to the footer showing current approvals (x/y). " +
-			"Notifies and optionally auto-prompts when new source-code comments appear or " +
-			"when all required approvals are met. Also detects merged/closed.\n\n" +
+			"Notifies and optionally auto-prompts when new source-code comments appear, " +
+			"when all required approvals are met, or when the MR develops conflicts with its target branch " +
+			"and needs a rebase. Also detects merged/closed. Keeps polling until the MR reaches a terminal state " +
+			"(merged/closed) — this is the intended way to babysit an MR all the way to merge.\n\n" +
 			"Supported URL formats:\n" +
 			"  GitLab MR:  https://<host>/group/project/-/merge_requests/IID\n" +
 			"  GitHub PR:  https://github.com/owner/repo/pull/NUMBER\n\n" +
 			"Required env vars: GITLAB_TOKEN (GitLab), GITHUB_TOKEN (GitHub)\n\n" +
-			"Set auto_prompt: false to suppress automatic agent prompts on activity.",
+			"Set auto_prompt: false to suppress automatic agent prompts on activity. " +
+			"Set auto_rebase: true if conflicts should be resolved by the agent immediately, without asking first.",
 		promptSnippet:
-			"Monitor a GitLab MR or GitHub PR for review comments and approvals",
+			"Monitor a GitLab MR or GitHub PR for review comments, approvals, and rebase-needed state",
 		promptGuidelines: [
 			"Call monitor_mr after opening or sharing a merge request to track review activity",
 			"Use a short descriptive label matching the MR topic or ticket number",
 			"Default poll interval is 1 minute — set lower (min 15s) for faster feedback",
 			"Set auto_prompt: false if you only want footer updates without agent interruptions",
+			"Set auto_rebase: true for repos that require rebase-before-merge (e.g. linear-history / fast-forward-only branches), so conflicts get fixed without waiting for a confirmation round-trip",
 		],
 		parameters: Type.Object({
 			url: Type.String({
@@ -1676,7 +1722,7 @@ export default function sessionContextExtension(pi: ExtensionAPI) {
 				Type.Boolean({
 					description:
 						"When true (default), automatically sends a user message to the agent " +
-						"when new code review comments appear or all required approvals are met. " +
+						"when new code review comments appear, all required approvals are met, or the MR needs a rebase. " +
 						"Set to false for silent footer-only updates.",
 				}),
 			),
@@ -1685,6 +1731,14 @@ export default function sessionContextExtension(pi: ExtensionAPI) {
 					description:
 						"When true (default), automatically sends a user message to the agent " +
 						"when the MR is merged. Set to false to suppress this.",
+				}),
+			),
+			auto_rebase: Type.Optional(
+				Type.Boolean({
+					description:
+						"When true, the rebase-needed prompt tells the agent to rebase immediately " +
+						"(fetch, rebase onto the target branch, resolve conflicts, force-push) instead of just flagging it. " +
+						"Defaults to false (flag only, agent/user decides).",
 				}),
 			),
 		}),
@@ -1719,10 +1773,12 @@ export default function sessionContextExtension(pi: ExtensionAPI) {
 				requiredApprovals: -1,
 				fullyApproved: false,
 				seenCommentIds: [],
+				conflictNotified: false,
 				mrStatus: "monitoring",
 				intervalSeconds,
 				autoPrompt: params.auto_prompt ?? true,
 				autoPromptMerged: params.auto_prompt_merged ?? true,
+				autoRebase: params.auto_rebase ?? false,
 			};
 
 			// Fetch initial state — all existing comments are marked as already seen
@@ -1732,8 +1788,11 @@ export default function sessionContextExtension(pi: ExtensionAPI) {
 				monitor.requiredApprovals = initial.requiredApprovals;
 				monitor.fullyApproved = initial.fullyApproved;
 				monitor.seenCommentIds = initial.commentIds;
+				// Don't mark conflictNotified yet — let the next poll tick fire the prompt,
+				// same as any other freshly-detected state change.
 				if (initial.merged) monitor.mrStatus = "merged";
 				else if (initial.closed) monitor.mrStatus = "closed";
+				else if (initial.hasConflicts) monitor.mrStatus = "needs_rebase";
 				else if (initial.fullyApproved) monitor.mrStatus = "approved";
 			}
 
@@ -1836,6 +1895,7 @@ export default function sessionContextExtension(pi: ExtensionAPI) {
 				const settingOptions = [
 					`auto_prompt: ${monitor.autoPrompt}`,
 					`auto_prompt_merged: ${monitor.autoPromptMerged}`,
+					`auto_rebase: ${monitor.autoRebase ?? false}`,
 					`interval_seconds: ${monitor.intervalSeconds}`,
 					"─ Done",
 				];
@@ -1847,6 +1907,8 @@ export default function sessionContextExtension(pi: ExtensionAPI) {
 
 				if (setting.startsWith("auto_prompt_merged")) {
 					monitor.autoPromptMerged = !monitor.autoPromptMerged;
+				} else if (setting.startsWith("auto_rebase")) {
+					monitor.autoRebase = !(monitor.autoRebase ?? false);
 				} else if (setting.startsWith("auto_prompt")) {
 					monitor.autoPrompt = !monitor.autoPrompt;
 				} else if (setting.startsWith("interval_seconds")) {

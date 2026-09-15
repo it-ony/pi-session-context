@@ -176,7 +176,8 @@ Use `monitor_mr` after opening a merge request to track review activity without 
   "url":              "https://gitlab.example.com/myorg/my-repo/-/merge_requests/771",
   "label":            "deploy",
   "interval_seconds": 60,
-  "auto_prompt":      true
+  "auto_prompt":      true,
+  "auto_rebase":      false
 }
 ```
 
@@ -194,8 +195,15 @@ Use `monitor_mr` after opening a merge request to track review activity without 
 | New source-code (diff) comments | `💬 deploy  1/2` | ✅ | ✅ (if `auto_prompt: true`) |
 | All required approvals met | `✅ deploy  2/2` | ✅ | ✅ (if `auto_prompt: true`) |
 | Approval count changes | `🔍 deploy  1/2 → 2/2` | — | — |
+| MR develops conflicts with target branch | `🔁 deploy` | ✅ | ✅ (if `auto_prompt: true`) |
 | MR merged | `🎉 deploy  merged` | ✅ | ✅ (if `auto_prompt_merged: true`) |
 | MR closed | `🚫 deploy  closed` | ✅ | — |
+
+**Rebase-needed detection:** the extension polls GitLab's `has_conflicts` field (GitHub: `mergeable_state === "dirty"`) on every tick. The
+first time a conflict appears, it notifies and — if `auto_prompt: true` — sends the agent a message. Set `auto_rebase: true` to make that
+message an instruction ("rebase now: fetch, rebase onto the target branch, resolve conflicts, force-push") instead of just a heads-up. This
+is meant for repos that require a rebase right before every merge (e.g. linear-history / fast-forward-only branch protection), where an
+MR can go stale again even after approval — keep `monitor_mr` running until merged/closed, not just until approved.
 
 **Approval ratio** — displayed as `x/y` in the footer label:
 - GitLab: sourced from the `/approvals` endpoint (`approved_by` / `approvals_required`)
@@ -210,6 +218,7 @@ Use `monitor_mr` after opening a merge request to track review activity without 
 | 🔍 | monitoring |
 | 💬 | new comments detected |
 | ✅ | fully approved |
+| 🔁 | needs rebase (conflicts with target branch) |
 | 🎉 | merged |
 | 🚫 | closed |
 | ⚠️ | fetch error |
