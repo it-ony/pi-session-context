@@ -194,12 +194,15 @@ Use `monitor_mr` after opening a merge request to track review activity without 
 | New source-code (diff) comments | `💬 deploy  1/2` | ✅ | ✅ (if `auto_prompt: true`) |
 | All required approvals met | `✅ deploy  2/2` | ✅ | ✅ (if `auto_prompt: true`) |
 | Approval count changes | `🔍 deploy  1/2 → 2/2` | — | — |
+| Merge conflicts (needs rebase) | `⚔️ deploy  1/2` | ✅ | ✅ (if `auto_prompt: true` and `notify_on_conflicts: true`) |
 | MR merged | `🎉 deploy  merged` | ✅ | ✅ (if `auto_prompt_merged: true`) |
 | MR closed | `🚫 deploy  closed` | ✅ | — |
 
 **Approval ratio** — displayed as `x/y` in the footer label:
 - GitLab: sourced from the `/approvals` endpoint (`approved_by` / `approvals_required`)
 - GitHub: unique approvers from `/reviews`; required count from branch protection (cached after first fetch, shown as `x/?` if unavailable)
+
+**Merge conflicts:** on by default. Reported once per conflict episode (when the MR goes from clean to conflicted; again if it clears and re-conflicts). Set `notify_on_conflicts: false` to disable. GitLab: `detailed_merge_status` (`conflict` / `need_rebase`) and `has_conflicts`; GitHub: `mergeable` / `mergeable_state` (`dirty`). While the forge is still computing mergeability (GitLab `checking` / `unchecked`, GitHub `mergeable: null`) the state is treated as unknown and nothing fires. Merged/closed MRs are ignored. Monitors persisted by older versions default to `notify_on_conflicts: true`.
 
 **Comment tracking:** only source-code / diff comments count (inline review threads). General MR description comments are ignored. All comments present at registration are marked as already seen — only comments added after `monitor_mr` is called trigger notifications.
 
@@ -209,6 +212,7 @@ Use `monitor_mr` after opening a merge request to track review activity without 
 |------|--------|
 | 🔍 | monitoring |
 | 💬 | new comments detected |
+| ⚔️ | merge conflicts (needs rebase) |
 | ✅ | fully approved |
 | 🎉 | merged |
 | 🚫 | closed |

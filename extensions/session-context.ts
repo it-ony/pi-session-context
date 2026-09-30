@@ -111,6 +111,7 @@ type MrMonitorStatus =
 	| "monitoring"
 	| "approved"
 	| "new_comments"
+	| "conflicts"
 	| "merged"
 	| "closed"
 	| "fetch_error";
@@ -119,6 +120,7 @@ const MR_STATUS_ICON: Record<MrMonitorStatus, string> = {
 	monitoring: "🔍",
 	approved: "✅",
 	new_comments: "💬",
+	conflicts: "⚔️",
 	merged: "🎉",
 	closed: "🚫",
 	fetch_error: "⚠️",
@@ -188,6 +190,8 @@ interface MrState {
 	commentIds: string[]; // all source-code comment IDs currently on the MR
 	merged: boolean;
 	closed: boolean;
+	/** true = conflicts / needs rebase, false = clean, null = unknown (still being computed) */
+	conflicts: boolean | null;
 }
 
 /** Persisted state for a single MR / PR monitor */
@@ -213,6 +217,10 @@ interface PersistedMrMonitor {
 	intervalSeconds: number;
 	autoPrompt: boolean;
 	autoPromptMerged: boolean;
+	/** Notify when the MR gets merge conflicts. Missing on older persisted monitors → treated as true. */
+	notifyOnConflicts?: boolean;
+	/** Last known conflict state, so we only fire once per conflict episode. Missing → false. */
+	hasConflicts?: boolean;
 }
 
 interface PersistedState {
@@ -423,6 +431,41 @@ async function fetchFailedJobs(monitor: PersistedMonitor): Promise<string[]> {
 
 // ── MR state fetching ─────────────────────────────────────────────────────────
 
+/**
+ * GitLab computes mergeability asynchronously: while `checking` / `unchecked`
+ * the answer is unknown (null), not "clean" and not "conflict".
+ */
+function gitLabConflictState(mr: {
+	has_conflicts?: boolean;
+	merge_status?: string;
+	detailed_merge_status?: string;
+}): boolean | null {
+	const detailed = mr.detailed_merge_status;
+	if (detailed === "conflict" || detailed === "need_rebase") return true;
+	if (
+		detailed === "checking" ||
+		detailed === "unchecked" ||
+		detailed === "preparing" ||
+		mr.merge_status === "checking" ||
+		mr.merge_status === "unchecked"
+	) {
+		return null;
+	}
+	if (typeof mr.has_conflicts === "boolean") return mr.has_conflicts;
+	return null;
+}
+
+/** GitHub: `mergeable` is null while being computed (unknown). */
+function gitHubConflictState(pr: {
+	mergeable?: boolean | null;
+	mergeable_state?: string;
+}): boolean | null {
+	if (pr.mergeable_state === "dirty") return true;
+	if (pr.mergeable === false) return true;
+	if (pr.mergeable === true) return false;
+	return null;
+}
+
 async function fetchGitLabMrState(
 	monitor: PersistedMrMonitor,
 ): Promise<MrState> {
@@ -440,7 +483,12 @@ async function fetchGitLabMrState(
 	]);
 
 	if (!mrRes.ok) throw new Error(`MR fetch failed: ${mrRes.status}`);
-	const mr = (await mrRes.json()) as { state: string };
+	const mr = (await mrRes.json()) as {
+		state: string;
+		has_conflicts?: boolean;
+		merge_status?: string;
+		detailed_merge_status?: string;
+	};
 
 	let approvalsCount = 0;
 	let requiredApprovals = 0;
@@ -490,6 +538,7 @@ async function fetchGitLabMrState(
 		commentIds,
 		merged: mr.state === "merged",
 		closed: mr.state === "closed",
+		conflicts: gitLabConflictState(mr),
 	};
 }
 
@@ -517,6 +566,8 @@ async function fetchGitHubPrState(
 		state: string;
 		merged: boolean;
 		base: { ref: string };
+		mergeable?: boolean | null;
+		mergeable_state?: string;
 	};
 
 	// Count unique approvers — last review state per user wins
@@ -589,6 +640,7 @@ async function fetchGitHubPrState(
 		commentIds,
 		merged: pr.merged === true,
 		closed: pr.state === "closed" && !pr.merged,
+		conflicts: gitHubConflictState(pr),
 	};
 }
 
@@ -995,6 +1047,46 @@ export default function sessionContextExtension(pi: ExtensionAPI) {
 						// ignore
 					}
 				}
+			}
+
+			// Detect merge conflicts (null = unknown → keep last known state).
+			// Fires once per conflict episode: on the clean → conflicted transition.
+			if (mrState.conflicts !== null) {
+				const wasConflicted = monitor.hasConflicts === true;
+				if (mrState.conflicts && !wasConflicted) {
+					monitor.hasConflicts = true;
+					changed = true;
+					if (monitor.notifyOnConflicts !== false && savedCtx.hasUI) {
+						savedCtx.ui.notify(`⚔️ ${monitor.label} — merge conflicts`, "info");
+						if (monitor.autoPrompt) {
+							const prompt = `The \`${monitor.label}\` MR has merge conflicts with its target branch and needs a rebase.\nMR: ${monitor.url}\nRebase onto the target branch non-interactively (no \`-i\`), resolve the conflicts, then push.`;
+							try {
+								if (savedCtx.isIdle()) {
+									pi.sendUserMessage(prompt);
+								} else {
+									pi.sendUserMessage(prompt, { deliverAs: "followUp" });
+								}
+							} catch {
+								// ignore
+							}
+						}
+					}
+				} else if (!mrState.conflicts && wasConflicted) {
+					monitor.hasConflicts = false;
+					changed = true;
+					if (monitor.mrStatus === "conflicts") {
+						monitor.mrStatus = monitor.fullyApproved
+							? "approved"
+							: "monitoring";
+						if (entry) entry.icon = MR_STATUS_ICON[monitor.mrStatus];
+					}
+				}
+			}
+			// Conflicted MRs keep the conflict icon in the footer until cleared
+			if (monitor.hasConflicts && monitor.mrStatus !== "conflicts") {
+				monitor.mrStatus = "conflicts";
+				if (entry) entry.icon = MR_STATUS_ICON.conflicts;
+				changed = true;
 			}
 
 			if (changed) {
@@ -1644,12 +1736,14 @@ export default function sessionContextExtension(pi: ExtensionAPI) {
 			"Monitor a GitLab MR or GitHub PR for new code review comments and approval status. " +
 			"Adds a live entry to the footer showing current approvals (x/y). " +
 			"Notifies and optionally auto-prompts when new source-code comments appear or " +
-			"when all required approvals are met. Also detects merged/closed.\n\n" +
+			"when all required approvals are met, and when the MR gets merge conflicts (needs a rebase). " +
+			"Also detects merged/closed.\n\n" +
 			"Supported URL formats:\n" +
 			"  GitLab MR:  https://<host>/group/project/-/merge_requests/IID\n" +
 			"  GitHub PR:  https://github.com/owner/repo/pull/NUMBER\n\n" +
 			"Required env vars: GITLAB_TOKEN (GitLab), GITHUB_TOKEN (GitHub)\n\n" +
-			"Set auto_prompt: false to suppress automatic agent prompts on activity.",
+			"Set auto_prompt: false to suppress automatic agent prompts on activity. " +
+			"Set notify_on_conflicts: false to stop merge-conflict reports (on by default).",
 		promptSnippet:
 			"Monitor a GitLab MR or GitHub PR for review comments and approvals",
 		promptGuidelines: [
@@ -1657,6 +1751,7 @@ export default function sessionContextExtension(pi: ExtensionAPI) {
 			"Use a short descriptive label matching the MR topic or ticket number",
 			"Default poll interval is 1 minute — set lower (min 15s) for faster feedback",
 			"Set auto_prompt: false if you only want footer updates without agent interruptions",
+			"Merge conflicts on the MR are reported by default; set notify_on_conflicts: false to turn that off",
 		],
 		parameters: Type.Object({
 			url: Type.String({
@@ -1685,6 +1780,14 @@ export default function sessionContextExtension(pi: ExtensionAPI) {
 					description:
 						"When true (default), automatically sends a user message to the agent " +
 						"when the MR is merged. Set to false to suppress this.",
+				}),
+			),
+			notify_on_conflicts: Type.Optional(
+				Type.Boolean({
+					description:
+						"When true (default), notifies (and auto-prompts the agent, unless auto_prompt is false) " +
+						"when the MR gets merge conflicts with its target branch and needs a rebase. " +
+						"Fires once per conflict episode. Set to false to suppress this.",
 				}),
 			),
 		}),
@@ -1723,6 +1826,8 @@ export default function sessionContextExtension(pi: ExtensionAPI) {
 				intervalSeconds,
 				autoPrompt: params.auto_prompt ?? true,
 				autoPromptMerged: params.auto_prompt_merged ?? true,
+				notifyOnConflicts: params.notify_on_conflicts ?? true,
+				hasConflicts: false,
 			};
 
 			// Fetch initial state — all existing comments are marked as already seen
@@ -1836,6 +1941,7 @@ export default function sessionContextExtension(pi: ExtensionAPI) {
 				const settingOptions = [
 					`auto_prompt: ${monitor.autoPrompt}`,
 					`auto_prompt_merged: ${monitor.autoPromptMerged}`,
+					`notify_on_conflicts: ${monitor.notifyOnConflicts !== false}`,
 					`interval_seconds: ${monitor.intervalSeconds}`,
 					"─ Done",
 				];
@@ -1845,7 +1951,9 @@ export default function sessionContextExtension(pi: ExtensionAPI) {
 				);
 				if (!setting || setting.startsWith("─")) break;
 
-				if (setting.startsWith("auto_prompt_merged")) {
+				if (setting.startsWith("notify_on_conflicts")) {
+					monitor.notifyOnConflicts = monitor.notifyOnConflicts === false;
+				} else if (setting.startsWith("auto_prompt_merged")) {
 					monitor.autoPromptMerged = !monitor.autoPromptMerged;
 				} else if (setting.startsWith("auto_prompt")) {
 					monitor.autoPrompt = !monitor.autoPrompt;
