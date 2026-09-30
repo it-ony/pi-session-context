@@ -2,21 +2,13 @@
 	"name": "pi-session-context",
 	"version": "1.4.0",
 	"description": "A pi coding agent extension that tracks and displays session context (worktree, Jira ticket, GitLab MR) in the footer",
-	"keywords": [
-		"pi-package",
-		"pi-extension",
-		"pi-coding-agent"
-	],
+	"keywords": ["pi-package", "pi-extension", "pi-coding-agent"],
 	"license": "MIT",
 	"repository": {
 		"type": "git",
 		"url": "git+https://github.com/it-ony/pi-session-context.git"
 	},
-	"files": [
-		"extensions",
-		"skills",
-		"README.md"
-	],
+	"files": ["extensions", "skills", "README.md"],
 	"type": "module",
 	"scripts": {
 		"lint": "biome check .",
@@ -24,20 +16,16 @@
 		"typecheck": "tsc --noEmit"
 	},
 	"pi": {
-		"extensions": [
-			"./extensions"
-		],
-		"skills": [
-			"./skills"
-		]
+		"extensions": ["./extensions"],
+		"skills": ["./skills"]
 	},
 	"peerDependencies": {
-		"@mariozechner/pi-coding-agent": "*",
+		"@earendil-works/pi-coding-agent": "^0.84.4",
 		"@sinclair/typebox": "*"
 	},
 	"devDependencies": {
 		"@biomejs/biome": "^1.9.4",
-		"@mariozechner/pi-coding-agent": "*",
+		"@earendil-works/pi-coding-agent": "^0.84.4",
 		"@sinclair/typebox": "*",
 		"typescript": "^5.8.3"
 	}

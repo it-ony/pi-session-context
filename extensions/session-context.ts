@@ -35,8 +35,8 @@ import * as nodePath from "node:path";
 import type {
 	ExtensionAPI,
 	ExtensionContext,
-} from "@mariozechner/pi-coding-agent";
-import { createBashTool } from "@mariozechner/pi-coding-agent";
+} from "@earendil-works/pi-coding-agent";
+import { createBashTool } from "@earendil-works/pi-coding-agent";
 import { Type } from "@sinclair/typebox";
 
 // ── Configuration ──────────────────────────────────────────────────────────────
@@ -776,6 +776,41 @@ export default function sessionContextExtension(pi: ExtensionAPI) {
 		pi.appendEntry(ENTRY_TYPE, { ...state });
 	}
 
+	async function sendAgentPrompt(
+		ctx: ExtensionContext,
+		prompt: string,
+		options?: { followUp?: boolean },
+	): Promise<"sent" | "queued"> {
+		const shouldQueue = options?.followUp ?? !ctx.isIdle();
+		if (shouldQueue) {
+			await Promise.resolve(
+				pi.sendUserMessage(prompt, { deliverAs: "followUp" }),
+			);
+			return "queued";
+		}
+		await Promise.resolve(pi.sendUserMessage(prompt));
+		return "sent";
+	}
+
+	function promptDeliveryText(delivery: "sent" | "queued"): string {
+		return delivery === "queued" ? "queued for agent" : "sent to agent";
+	}
+
+	async function notifyWithAgentPrompt(
+		ctx: ExtensionContext,
+		prompt: string,
+		notification: string,
+		level: "info" | "error",
+		options?: { followUp?: boolean },
+	): Promise<void> {
+		try {
+			const delivery = await sendAgentPrompt(ctx, prompt, options);
+			ctx.ui.notify(`${notification} — ${promptDeliveryText(delivery)}`, level);
+		} catch {
+			ctx.ui.notify(`${notification} — failed to notify agent`, "error");
+		}
+	}
+
 	// ── Footer rendering ──────────────────────────────────────────────────────
 
 	function renderEntry(
@@ -944,22 +979,13 @@ export default function sessionContextExtension(pi: ExtensionAPI) {
 				}
 				persist();
 				refreshStatus(savedCtx);
+				const notification = `${MR_STATUS_ICON[terminalStatus]} ${monitor.label} — ${terminalStatus}`;
 				if (savedCtx.hasUI) {
-					savedCtx.ui.notify(
-						`${MR_STATUS_ICON[terminalStatus]} ${monitor.label} — ${terminalStatus}`,
-						"info",
-					);
-				}
-				if (mrState.merged && monitor.autoPromptMerged && savedCtx.hasUI) {
-					const prompt = `The \`${monitor.label}\` MR has been merged.\nMR: ${monitor.url}`;
-					try {
-						if (savedCtx.isIdle()) {
-							pi.sendUserMessage(prompt);
-						} else {
-							pi.sendUserMessage(prompt, { deliverAs: "followUp" });
-						}
-					} catch {
-						// ignore
+					if (mrState.merged && monitor.autoPromptMerged) {
+						const prompt = `The \`${monitor.label}\` MR has been merged.\nMR: ${monitor.url}`;
+						await notifyWithAgentPrompt(savedCtx, prompt, notification, "info");
+					} else {
+						savedCtx.ui.notify(notification, "info");
 					}
 				}
 				return;
@@ -976,22 +1002,13 @@ export default function sessionContextExtension(pi: ExtensionAPI) {
 				monitor.mrStatus = "new_comments";
 				changed = true;
 				if (entry) entry.icon = MR_STATUS_ICON.new_comments;
+				const notification = `💬 ${monitor.label} — ${newIds.length} new code review comment(s)`;
 				if (savedCtx.hasUI) {
-					savedCtx.ui.notify(
-						`💬 ${monitor.label} — ${newIds.length} new code review comment(s)`,
-						"info",
-					);
-				}
-				if (monitor.autoPrompt && savedCtx.hasUI) {
-					const prompt = `The \`${monitor.label}\` MR has ${newIds.length} new code review comment(s).\nMR: ${monitor.url}`;
-					try {
-						if (savedCtx.isIdle()) {
-							pi.sendUserMessage(prompt);
-						} else {
-							pi.sendUserMessage(prompt, { deliverAs: "followUp" });
-						}
-					} catch {
-						// ignore
+					if (monitor.autoPrompt) {
+						const prompt = `The \`${monitor.label}\` MR has ${newIds.length} new code review comment(s).\nMR: ${monitor.url}`;
+						await notifyWithAgentPrompt(savedCtx, prompt, notification, "info");
+					} else {
+						savedCtx.ui.notify(notification, "info");
 					}
 				}
 			}
@@ -1029,22 +1046,13 @@ export default function sessionContextExtension(pi: ExtensionAPI) {
 					monitor.requiredApprovals >= 0
 						? String(monitor.requiredApprovals)
 						: "?";
+				const notification = `✅ ${monitor.label} — approved (${monitor.approvals}/${req})`;
 				if (savedCtx.hasUI) {
-					savedCtx.ui.notify(
-						`✅ ${monitor.label} — approved (${monitor.approvals}/${req})`,
-						"info",
-					);
-				}
-				if (monitor.autoPrompt && savedCtx.hasUI) {
-					const prompt = `The \`${monitor.label}\` MR has been approved (${monitor.approvals}/${req}).\nMR: ${monitor.url}`;
-					try {
-						if (savedCtx.isIdle()) {
-							pi.sendUserMessage(prompt);
-						} else {
-							pi.sendUserMessage(prompt, { deliverAs: "followUp" });
-						}
-					} catch {
-						// ignore
+					if (monitor.autoPrompt) {
+						const prompt = `The \`${monitor.label}\` MR has been approved (${monitor.approvals}/${req}).\nMR: ${monitor.url}`;
+						await notifyWithAgentPrompt(savedCtx, prompt, notification, "info");
+					} else {
+						savedCtx.ui.notify(notification, "info");
 					}
 				}
 			}
@@ -1057,18 +1065,17 @@ export default function sessionContextExtension(pi: ExtensionAPI) {
 					monitor.hasConflicts = true;
 					changed = true;
 					if (monitor.notifyOnConflicts !== false && savedCtx.hasUI) {
-						savedCtx.ui.notify(`⚔️ ${monitor.label} — merge conflicts`, "info");
+						const notification = `⚔️ ${monitor.label} — merge conflicts`;
 						if (monitor.autoPrompt) {
 							const prompt = `The \`${monitor.label}\` MR has merge conflicts with its target branch and needs a rebase.\nMR: ${monitor.url}\nRebase onto the target branch non-interactively (no \`-i\`), resolve the conflicts, then push.`;
-							try {
-								if (savedCtx.isIdle()) {
-									pi.sendUserMessage(prompt);
-								} else {
-									pi.sendUserMessage(prompt, { deliverAs: "followUp" });
-								}
-							} catch {
-								// ignore
-							}
+							await notifyWithAgentPrompt(
+								savedCtx,
+								prompt,
+								notification,
+								"info",
+							);
+						} else {
+							savedCtx.ui.notify(notification, "info");
 						}
 					}
 				} else if (!mrState.conflicts && wasConflicted) {
@@ -1119,20 +1126,9 @@ export default function sessionContextExtension(pi: ExtensionAPI) {
 				if (newlyFailed.length > 0) {
 					monitor.seenFailedJobNames = [...seen, ...newlyFailed];
 					persist();
-					savedCtx.ui.notify(
-						`❌ ${monitor.label} — job(s) failed: ${newlyFailed.join(", ")}`,
-						"error",
-					);
+					const notification = `❌ ${monitor.label} — job(s) failed: ${newlyFailed.join(", ")}`;
 					const prompt = `Job(s) \`${newlyFailed.join("`, `")}\` failed in the \`${monitor.label}\` pipeline (still running).\nPipeline: ${monitor.url}`;
-					try {
-						if (savedCtx.isIdle()) {
-							pi.sendUserMessage(prompt);
-						} else {
-							pi.sendUserMessage(prompt, { deliverAs: "followUp" });
-						}
-					} catch {
-						// ignore
-					}
+					await notifyWithAgentPrompt(savedCtx, prompt, notification, "error");
 				}
 			}
 
@@ -1153,13 +1149,7 @@ export default function sessionContextExtension(pi: ExtensionAPI) {
 
 			if (isTerminal(newStatus)) {
 				stopPoller(monitor.key);
-				if (savedCtx.hasUI) {
-					savedCtx.ui.notify(
-						`${STATUS_ICON[newStatus]} ${monitor.label} — ${newStatus}`,
-						newStatus === "success" ? "info" : "error",
-					);
-				}
-				// Auto-inject a user message so the agent responds to the failure
+				const notification = `${STATUS_ICON[newStatus]} ${monitor.label} — ${newStatus}`;
 				const notifyOn = monitor.notifyOn ?? ["failed"];
 				if (
 					notifyOn.includes(newStatus) &&
@@ -1174,15 +1164,17 @@ export default function sessionContextExtension(pi: ExtensionAPI) {
 						if (unreported.length > 0)
 							prompt += `\nFailed jobs: ${unreported.join(", ")}`;
 					}
-					try {
-						if (savedCtx.isIdle()) {
-							pi.sendUserMessage(prompt);
-						} else {
-							pi.sendUserMessage(prompt, { deliverAs: "followUp" });
-						}
-					} catch {
-						// Ignore — agent may not be in a receptive state
-					}
+					await notifyWithAgentPrompt(
+						savedCtx,
+						prompt,
+						notification,
+						newStatus === "success" ? "info" : "error",
+					);
+				} else if (savedCtx.hasUI) {
+					savedCtx.ui.notify(
+						notification,
+						newStatus === "success" ? "info" : "error",
+					);
 				}
 			}
 		}, monitor.intervalSeconds * 1000);
@@ -1508,10 +1500,7 @@ export default function sessionContextExtension(pi: ExtensionAPI) {
 				startPoller(monitor);
 			} else {
 				// Already finished — notify immediately, no polling needed
-				ctx.ui.notify(
-					`${STATUS_ICON[monitor.status]} ${monitor.label} — ${monitor.status}`,
-					monitor.status === "success" ? "info" : "error",
-				);
+				const notification = `${STATUS_ICON[monitor.status]} ${monitor.label} — ${monitor.status}`;
 				const notifyOn = monitor.notifyOn ?? ["failed"];
 				if (notifyOn.includes(monitor.status) && monitor.autoPrompt) {
 					let prompt = `The \`${monitor.label}\` pipeline ${STATUS_PROMPT_VERB[monitor.status] ?? monitor.status}.\nPipeline: ${monitor.url}`;
@@ -1525,11 +1514,20 @@ export default function sessionContextExtension(pi: ExtensionAPI) {
 						if (unreported.length > 0)
 							prompt += `\nFailed jobs: ${unreported.join(", ")}`;
 					}
-					try {
-						pi.sendUserMessage(prompt, { deliverAs: "followUp" });
-					} catch {
-						// Ignore — agent may not be in a receptive state
-					}
+					await notifyWithAgentPrompt(
+						ctx,
+						prompt,
+						notification,
+						monitor.status === "success" ? "info" : "error",
+						{
+							followUp: true,
+						},
+					);
+				} else {
+					ctx.ui.notify(
+						notification,
+						monitor.status === "success" ? "info" : "error",
+					);
 				}
 			}
 
@@ -1609,6 +1607,90 @@ export default function sessionContextExtension(pi: ExtensionAPI) {
 					{ type: "text", text: `Stopped monitoring ${monitor.label}.` },
 				],
 				details: { label: monitor.label },
+			};
+		},
+	});
+
+	// ── list_context tool ───────────────────────────────────────────────────────
+
+	pi.registerTool({
+		name: "list_context",
+		label: "List Context",
+		description:
+			"List all keys currently set in the session context footer. " +
+			"Use this to see what keys exist before calling set_context or clear_context.",
+		promptSnippet: "List all current context keys and their values",
+		parameters: Type.Object({}),
+
+		async execute(_id, _params, _signal, _onUpdate, _ctx) {
+			const entries = Object.entries(state.context);
+			if (entries.length === 0) {
+				return {
+					content: [{ type: "text" as const, text: "Context is empty." }],
+					details: { context: {} },
+				};
+			}
+			const lines = entries.map(([k, v]) => {
+				const type = v.type ? ` (${v.type})` : "";
+				return `  ${k}${type}: ${v.value}`;
+			});
+			return {
+				content: [
+					{ type: "text" as const, text: `Context keys:\n${lines.join("\n")}` },
+				],
+				details: { context: state.context },
+			};
+		},
+	});
+
+	// ── clear_context tool ────────────────────────────────────────────────────
+
+	pi.registerTool({
+		name: "clear_context",
+		label: "Clear Context",
+		description:
+			"Clear context keys from the footer. " +
+			"If keys is provided, only those keys are cleared. " +
+			"If keys is empty or omitted, ALL context keys are cleared (including stopping all monitors).",
+		promptSnippet: "Clear all or specific context keys from the footer",
+		parameters: Type.Object({
+			keys: Type.Optional(
+				Type.Array(Type.String(), {
+					description:
+						"Specific keys to clear. Omit or pass [] to clear everything.",
+				}),
+			),
+		}),
+
+		async execute(_id, params, _signal, _onUpdate, ctx) {
+			const keysToRemove =
+				params.keys && params.keys.length > 0
+					? params.keys
+					: Object.keys(state.context);
+
+			const cleared: string[] = [];
+			for (const key of keysToRemove) {
+				if (state.context[key] !== undefined) {
+					delete state.context[key];
+					delete state.derived[key];
+					stopPoller(key);
+					stopMrPoller(key);
+					state.monitors = state.monitors.filter((m) => m.key !== key);
+					state.mrMonitors = state.mrMonitors.filter((m) => m.key !== key);
+					cleared.push(key);
+				}
+			}
+
+			persist();
+			refreshStatus(ctx);
+
+			const msg =
+				cleared.length > 0
+					? `Cleared: ${cleared.join(", ")}`
+					: "Nothing to clear.";
+			return {
+				content: [{ type: "text" as const, text: msg }],
+				details: { cleared },
 			};
 		},
 	});
